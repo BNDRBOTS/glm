@@ -1,0 +1,8 @@
+[test]
+preload = ["./tests/preload.ts"]
+
+[install]
+# Map server-only to a stub for the test runner.
+# Production still gets the real package via Next.js's react-server condition.
+[test.alias]
+"server-only" = "./tests/stub-server-only.ts"

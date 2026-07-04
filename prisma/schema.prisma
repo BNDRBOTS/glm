@@ -1,0 +1,393 @@
+// =====================================================================
+// GLM Power Platform — Prisma Schema
+// ---------------------------------------------------------------------
+// Modular by design. Every future capability (Stripe, Pinecone memory
+// mesh, behavioral wrappers, more users) has a slot already.
+//
+// Two fully separate accounts. Group chats link ONLY the accounts you
+// explicitly put in a Group — nothing else bleeds across.
+// =====================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// ---------------------------------------------------------------------
+// DATABASE PROVIDER — env-driven
+// ---------------------------------------------------------------------
+// Local preview / dev:   provider = "sqlite"     (DATABASE_URL=file:./db/custom.db)
+// Railway / production:  provider = "postgresql" (DATABASE_URL=postgresql://...)
+//
+// The provider is selected at `prisma generate` / `prisma db push` time
+// via prisma.config.ts (see repo root). At runtime Prisma Client is
+// agnostic to which provider generated it — both produce identical
+// SQL for the operations this app uses (no SQLite-specific features).
+// ---------------------------------------------------------------------
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------
+// Identity & Auth
+// ---------------------------------------------------------------------
+
+model User {
+  id            String    @id @default(cuid())
+  email         String    @unique
+  name          String?
+  passwordHash  String
+  // Which GLM model is the default for this user. GLM-5.2 is the peak.
+  // Quick models live in the Model catalog below — user can switch per chat.
+  defaultModel  String    @default("glm-5.2")
+  // Role: OWNER | BUDDY | MEMBER (room for platform expansion later)
+  role          String    @default("MEMBER")
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  accounts      Account[]
+  sessions      Session[]
+  chats         Chat[]
+  messages      Message[]
+  groupMemberships GroupMember[]
+  integrations  Integration[]
+  memoryLogs    MemoryLog[]
+  usageLogs     UsageLog[]
+  exports       ChatExport[]
+  skills        Skill[]
+  passwordResetTokens PasswordResetToken[]
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String?
+  access_token      String?
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String?
+  session_state     String?
+  user              User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+// ---------------------------------------------------------------------
+// Password reset — single-use, 1-hour TTL, scoped to a user
+// ---------------------------------------------------------------------
+
+model PasswordResetToken {
+  id        String   @id @default(cuid())
+  userId    String
+  token     String   @unique
+  // Hashed at rest — if the DB leaks, the tokens can't be used directly.
+  tokenHash String   @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime @default(now())
+
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+// ---------------------------------------------------------------------
+// Chats & Messages — turn-by-turn JSON logging lives here
+// ---------------------------------------------------------------------
+
+model Chat {
+  id          String    @id @default(cuid())
+  // OWNER-only chats are private. GROUP chats are shared via GroupMember.
+  type        String    @default("PRIVATE") // PRIVATE | GROUP
+  ownerId     String
+  groupId     String?
+  title       String    @default("New chat")
+  model       String    @default("glm-5.2")
+  // System prompt is per-chat so behavioral wrappers can override later.
+  systemPrompt String?
+  // Arbitrary metadata for future wrappers (temperature, tools, etc.)
+  settings    String?
+  pinned      Boolean   @default(false)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  owner       User      @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  group       Group?    @relation(fields: [groupId], references: [id])
+  messages    Message[]
+  attachments Attachment[]
+  exports     ChatExport[]
+  canvasStates CanvasState[]
+  usageLogs   UsageLog[]
+
+  @@index([ownerId])
+  @@index([groupId])
+}
+
+model Message {
+  id          String   @id @default(cuid())
+  chatId      String
+  // Author — null means assistant
+  authorId    String?
+  role        String   // user | assistant | system | tool
+  content     String
+  // Turn-by-turn JSON log: every turn is a structured object.
+  // This is what survives across sessions and feeds the memory aggregator.
+  turnLog     String?
+  // Model used for this turn (null for user turns)
+  model       String?
+  // Token accounting
+  promptTokens     Int?
+  completionTokens Int?
+  totalTokens      Int?
+  // Optional tool/integration metadata
+  toolCalls   String?
+  // For the canvas back-button — pointer to the previous message state
+  parentMessageId String?
+  createdAt   DateTime @default(now())
+
+  author      User?    @relation(fields: [authorId], references: [id], onDelete: SetNull)
+  chat        Chat     @relation(fields: [chatId], references: [id], onDelete: Cascade)
+  attachments Attachment[]
+
+  @@index([chatId])
+  @@index([authorId])
+}
+
+model Attachment {
+  id        String   @id @default(cuid())
+  chatId    String
+  messageId String?
+  filename  String
+  mimeType  String
+  size      Int
+  // Local FS path on the server (or object storage URL later)
+  storage   String   @default("LOCAL") // LOCAL | S3 | NOTION | GITHUB
+  storageKey String
+  createdAt DateTime @default(now())
+
+  chat      Chat     @relation(fields: [chatId], references: [id], onDelete: Cascade)
+  message   Message? @relation(fields: [messageId], references: [id], onDelete: SetNull)
+}
+
+// ---------------------------------------------------------------------
+// Groups — shared chats between specific accounts, nothing else
+// ---------------------------------------------------------------------
+
+model Group {
+  id          String   @id @default(cuid())
+  name        String
+  slug        String   @unique
+  description String?
+  // ROOM for Stripe later: a group can be tied to a subscription
+  stripeCustomerId String?
+  stripeSubscriptionId String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  members     GroupMember[]
+  chats       Chat[]
+}
+
+model GroupMember {
+  id        String   @id @default(cuid())
+  groupId   String
+  userId    String
+  role      String   @default("MEMBER") // OWNER | ADMIN | MEMBER
+  createdAt DateTime @default(now())
+
+  group     Group    @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([groupId, userId])
+}
+
+// ---------------------------------------------------------------------
+// Integrations — drop-in API key pattern (Notion, GitHub, Courtroom5, Local FS)
+// ---------------------------------------------------------------------
+
+model Integration {
+  id        String   @id @default(cuid())
+  userId    String
+  // notion | github | courtroom5 | localfs | backend:supabase | ...
+  provider  String
+  // Encrypted at rest by the app layer
+  credentials String
+  // Per-integration config (workspace id, repo list, etc.)
+  config    String?
+  enabled   Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, provider])
+}
+
+// ---------------------------------------------------------------------
+// Memory — turn-by-turn JSON log + aggregated facts
+// ---------------------------------------------------------------------
+
+model MemoryLog {
+  id        String   @id @default(cuid())
+  userId    String
+  chatId    String?
+  // JSON blob: structured turn record
+  // { role, content, model, tokens, timestamp, factsExtracted[], entities[] }
+  payload   String
+  // Easy filter — type of memory record
+  kind      String   @default("TURN") // TURN | SUMMARY | FACT | ENTITY
+  createdAt DateTime @default(now())
+
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([chatId])
+}
+
+// ---------------------------------------------------------------------
+// Exports — both raw chat and deep aggregated export
+// ---------------------------------------------------------------------
+
+model ChatExport {
+  id        String   @id @default(cuid())
+  chatId    String
+  userId    String
+  // raw | aggregated
+  type      String
+  // JSON blob — either raw messages or aggregated facts/entities/summary
+  payload   String
+  // Optional file path if downloaded as file
+  filename  String?
+  createdAt DateTime @default(now())
+
+  chat      Chat     @relation(fields: [chatId], references: [id], onDelete: Cascade)
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+// ---------------------------------------------------------------------
+// Usage & Billing — Stripe hooks slot (no implementation now)
+// ---------------------------------------------------------------------
+
+model UsageLog {
+  id        String   @id @default(cuid())
+  userId    String
+  chatId    String?
+  model     String
+  promptTokens     Int
+  completionTokens Int
+  totalTokens      Int
+  // Cost in cents — populated by billing adapter later
+  costCents Int?
+  createdAt DateTime @default(now())
+
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  chat      Chat?    @relation(fields: [chatId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
+}
+
+// ---------------------------------------------------------------------
+// Canvas — code canvas with version history (back-button)
+// ---------------------------------------------------------------------
+
+model CanvasState {
+  id        String   @id @default(cuid())
+  chatId    String
+  // html | react | prototype
+  kind      String   @default("html")
+  // The actual code rendered in the canvas
+  source    String
+  // Optional: previous state pointer (back-button support)
+  parentId  String?
+  // Optional: which message triggered this state
+  messageId String?
+  createdAt DateTime @default(now())
+
+  chat      Chat     @relation(fields: [chatId], references: [id], onDelete: Cascade)
+
+  @@index([chatId])
+}
+
+// ---------------------------------------------------------------------
+// Skills — reusable behavioral wrappers (maker + accepter + reader)
+// ---------------------------------------------------------------------
+
+model Skill {
+  id           String   @id @default(cuid())
+  // owner = the user who created or imported this skill
+  ownerId      String
+  name         String
+  description  String
+  // The system prompt that defines the skill's behavior
+  systemPrompt String
+  // Default execution mode when this skill is active
+  mode         String   @default("auto") // auto | plan | accept-edits
+  fullBuildOnly Boolean @default(true)
+  // JSON array of connector IDs this skill is allowed to use
+  allowedConnectors String?
+  // JSON array of backend IDs this skill is allowed to use
+  allowedBackends   String?
+  // JSON array of trigger phrases — when AI sees these in user input,
+  // suggest this skill
+  triggers     String?
+  // Version (for accepter/import — detect when skill updates exist)
+  version      Int      @default(1)
+  // Origin: created locally vs imported
+  origin       String   @default("local") // local | imported
+  // Optional: skill author name (for imported skills)
+  author       String?
+  // Enabled = shows in skill picker
+  enabled      Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  owner        User     @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+
+  @@index([ownerId])
+}
+
+// ---------------------------------------------------------------------
+// Unified Audit Log — single source of truth for all system events
+// ---------------------------------------------------------------------
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  userId    String?
+  // Source module: chat | voice | connector | backend | quality |
+  // distillation | billing | skill | auth | system
+  source    String
+  // info | warn | error | debug
+  level     String   @default("info")
+  // Short event title
+  event     String
+  // JSON blob with full event payload
+  payload   String?
+  // Optional related chat
+  chatId    String?
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([source])
+  @@index([level])
+  @@index([createdAt])
+}
