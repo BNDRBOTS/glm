@@ -47,6 +47,17 @@ interface GroupsPanelProps {
   onStartGroupChat: (groupId: string) => void;
 }
 
+/** Pure fetch helper — no state access, shared by effect + handlers. */
+async function fetchGroupsList(): Promise<GroupData[]> {
+  try {
+    const r = await fetch("/api/groups");
+    const j = await r.json();
+    return j.groups ?? [];
+  } catch {
+    return [];
+  }
+}
+
 export function GroupsPanel({ open, onOpenChange, onStartGroupChat }: GroupsPanelProps) {
   const [groups, setGroups] = React.useState<GroupData[]>([]);
   const [loading, setLoading] = React.useState(false);
@@ -66,20 +77,25 @@ export function GroupsPanel({ open, onOpenChange, onStartGroupChat }: GroupsPane
 
   const refresh = React.useCallback(async () => {
     setLoading(true);
-    try {
-      const r = await fetch("/api/groups");
-      const j = await r.json();
-      setGroups(j.groups ?? []);
-    } catch {
-      setGroups([]);
-    } finally {
-      setLoading(false);
-    }
+    setGroups(await fetchGroupsList());
+    setLoading(false);
   }, []);
 
+  // State updates only in async callbacks — never synchronously in
+  // the effect body (react-hooks/set-state-in-effect).
   React.useEffect(() => {
-    if (open) refresh();
-  }, [open, refresh]);
+    if (!open) return;
+    let cancelled = false;
+    queueMicrotask(() => {
+      if (!cancelled) setLoading(true);
+    });
+    fetchGroupsList().then((groups) => {
+      if (cancelled) return;
+      setGroups(groups);
+      setLoading(false);
+    });
+    return () => { cancelled = true; };
+  }, [open]);
 
   async function loadGroupDetail(id: string) {
     try {

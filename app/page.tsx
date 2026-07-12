@@ -41,35 +41,9 @@ export default function HomePage() {
   const [paletteOpen, setPaletteOpen] = React.useState(false);
   const [session, setSession] = React.useState<SessionInfo | null>(null);
 
-  // Fetch session truth (replaces hardcoded account menu + sidebar footer)
-  const refreshSession = React.useCallback(async () => {
-    try {
-      const r = await fetch("/api/session");
-      if (!r.ok) return;
-      const j = await r.json();
-      setSession(j);
-    } catch {
-      // ignore — UI shows "Not signed in" via null
-    }
-  }, []);
-
   // Apply persisted theme on mount
   React.useEffect(() => {
     applyTheme(loadPersistedTheme());
-  }, []);
-
-  // Fetch existing chats + integrations + skills on mount. Previously
-  // the sidebar showed "No chats yet" even when the DB had saved chats,
-  // because there was no fetch on mount AND no /api/chats endpoint.
-  const refreshChats = React.useCallback(async () => {
-    try {
-      const r = await fetch("/api/chats");
-      if (!r.ok) return;
-      const j = await r.json();
-      if (Array.isArray(j.chats)) setChats(j.chats);
-    } catch {
-      // ignore — sidebar just shows empty
-    }
   }, []);
 
   // Fetch integrations + skills on mount
@@ -81,9 +55,23 @@ export default function HomePage() {
     } catch {}
   }, []);
 
+  // Mount fetches: session truth (replaces hardcoded account menu),
+  // existing chats (sidebar), connectors/backends/skills. All state
+  // updates happen in promise callbacks — never synchronously in the
+  // effect body (react-hooks/set-state-in-effect).
   React.useEffect(() => {
-    refreshChats();
-    refreshSession();
+    fetch("/api/chats")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((j) => {
+        if (j && Array.isArray(j.chats)) setChats(j.chats);
+      })
+      .catch(() => {}); // sidebar just shows empty
+    fetch("/api/session")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((j) => {
+        if (j) setSession(j);
+      })
+      .catch(() => {}); // UI shows "Not signed in" via null
     Promise.all([
       fetch("/api/connectors").then((r) => r.json()).catch(() => ({ connectors: [] })),
       fetch("/api/backends").then((r) => r.json()).catch(() => ({ backends: [] })),

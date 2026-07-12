@@ -188,6 +188,21 @@ async function retrieveViaPgvector(
   }
 
   const queryEmbedding = await embedText(query, provider);
+  const chunks = await queryPgvectorRpc(config, userId, queryEmbedding, options);
+  return { chunks, providersQueried: [provider] };
+}
+
+/**
+ * Raw match_rag_chunks RPC call + result mapping. Split from
+ * retrieveViaPgvector so the request shape is unit-testable against a
+ * mock PostgREST server without a real embedding provider.
+ */
+export async function queryPgvectorRpc(
+  config: { url: string; serviceKey: string },
+  userId: string,
+  queryEmbedding: number[],
+  options: RankOptions = {}
+): Promise<ScoredChunk[]> {
   const res = await fetch(`${config.url}/rest/v1/rpc/match_rag_chunks`, {
     method: "POST",
     headers: {
@@ -215,17 +230,14 @@ async function retrieveViaPgvector(
     similarity: number;
   }[];
 
-  return {
-    chunks: (data ?? []).map((r) => ({
-      id: r.id,
-      documentId: r.document_id,
-      documentTitle: r.document_title,
-      chunkIndex: r.chunk_index,
-      content: r.content,
-      similarity: r.similarity,
-    })),
-    providersQueried: [provider],
-  };
+  return (data ?? []).map((r) => ({
+    id: r.id,
+    documentId: r.document_id,
+    documentTitle: r.document_title,
+    chunkIndex: r.chunk_index,
+    content: r.content,
+    similarity: r.similarity,
+  }));
 }
 
 // ----- pgvector mirror maintenance (called by ingest/delete) ------------

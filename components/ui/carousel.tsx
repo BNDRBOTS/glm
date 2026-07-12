@@ -95,11 +95,17 @@ function Carousel({
 
   React.useEffect(() => {
     if (!api) return
-    onSelect(api)
+    // Initial snapshot deferred a microtask so no setState runs
+    // synchronously in the effect body (react-hooks/set-state-in-effect).
+    let cancelled = false
+    queueMicrotask(() => {
+      if (!cancelled) onSelect(api)
+    })
     api.on("reInit", onSelect)
     api.on("select", onSelect)
 
     return () => {
+      cancelled = true
       api?.off("select", onSelect)
     }
   }, [api, onSelect])

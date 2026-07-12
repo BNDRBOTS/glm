@@ -1127,6 +1127,170 @@ await test("rag driver defaults to local; supabase requires full config", async 
 });
 
 // ---------------------------------------------------------------------
+// RAG — Supabase pgvector driver against a mock PostgREST server.
+// Verifies request shape, result mapping, the local-embedding refusal,
+// automatic fallback to the local driver, and mirror/remove calls —
+// no real Supabase needed.
+// ---------------------------------------------------------------------
+
+console.log("\nRAG pgvector driver (mock PostgREST)");
+{
+  interface MockCall {
+    method: string;
+    path: string;
+    query: string;
+    headers: Record<string, string | undefined>;
+    body: unknown;
+  }
+  const calls: MockCall[] = [];
+  let failNextRpc = false;
+
+  const mock = Bun.serve({
+    port: 0,
+    async fetch(req) {
+      const url = new URL(req.url);
+      const body = req.method === "GET" || req.method === "DELETE" ? null : await req.json();
+      calls.push({
+        method: req.method,
+        path: url.pathname,
+        query: url.search,
+        headers: {
+          apikey: req.headers.get("apikey") ?? undefined,
+          authorization: req.headers.get("authorization") ?? undefined,
+          prefer: req.headers.get("prefer") ?? undefined,
+        },
+        body,
+      });
+      if (url.pathname === "/rest/v1/rpc/match_rag_chunks") {
+        if (failNextRpc) {
+          failNextRpc = false;
+          return new Response(JSON.stringify({ message: "function unavailable" }), { status: 500 });
+        }
+        return Response.json([
+          {
+            id: "pg-1",
+            document_id: "doc-9",
+            document_title: "PG Doc",
+            chunk_index: 3,
+            content: "pgvector matched content",
+            similarity: 0.91,
+          },
+        ]);
+      }
+      if (url.pathname === "/rest/v1/rag_chunks") {
+        return req.method === "DELETE" ? new Response(null, { status: 204 }) : Response.json([]);
+      }
+      return new Response("not found", { status: 404 });
+    },
+  });
+  const baseUrl = `http://127.0.0.1:${mock.port}`;
+
+  const withSupabaseEnv = async (fn: () => Promise<void>) => {
+    const orig = {
+      driver: process.env.RAG_DRIVER,
+      url: process.env.SUPABASE_URL,
+      key: process.env.SUPABASE_SERVICE_ROLE_KEY,
+      embed: process.env.RAG_EMBEDDINGS_PROVIDER,
+      openai: process.env.OPENAI_API_KEY,
+      zai: process.env.ZAI_API_KEY,
+    };
+    process.env.RAG_DRIVER = "supabase";
+    process.env.SUPABASE_URL = baseUrl;
+    process.env.SUPABASE_SERVICE_ROLE_KEY = "test-service-key";
+    delete process.env.RAG_EMBEDDINGS_PROVIDER;
+    delete process.env.OPENAI_API_KEY;
+    delete process.env.ZAI_API_KEY;
+    try {
+      await fn();
+    } finally {
+      for (const [k, v] of Object.entries({
+        RAG_DRIVER: orig.driver,
+        SUPABASE_URL: orig.url,
+        SUPABASE_SERVICE_ROLE_KEY: orig.key,
+        RAG_EMBEDDINGS_PROVIDER: orig.embed,
+        OPENAI_API_KEY: orig.openai,
+        ZAI_API_KEY: orig.zai,
+      })) {
+        if (v) process.env[k] = v;
+        else delete process.env[k];
+      }
+    }
+  };
+
+  await test("queryPgvectorRpc sends service-key auth + correct RPC payload and maps results", async () => {
+    const { queryPgvectorRpc } = await import("@/lib/rag/retriever");
+    calls.length = 0;
+    const chunks = await queryPgvectorRpc(
+      { url: baseUrl, serviceKey: "test-service-key" },
+      "user-1",
+      [0.5, 0.5],
+      { topK: 4, matchThreshold: 0.42 }
+    );
+    const call = calls.find((c) => c.path === "/rest/v1/rpc/match_rag_chunks");
+    ok(call, "should POST the RPC");
+    eq(call!.headers.apikey, "test-service-key");
+    eq(call!.headers.authorization, "Bearer test-service-key");
+    const payload = call!.body as Record<string, unknown>;
+    eq(payload.p_user_id, "user-1", "server-supplied user id — the isolation boundary");
+    eq(payload.match_count, 4);
+    eq(payload.match_threshold, 0.42);
+    eq(payload.query_embedding, [0.5, 0.5]);
+    eq(chunks.length, 1);
+    eq(chunks[0].documentTitle, "PG Doc", "snake_case → camelCase mapping");
+    eq(chunks[0].chunkIndex, 3);
+    eq(chunks[0].similarity, 0.91);
+  });
+
+  await test("queryPgvectorRpc surfaces RPC failures (feeds the fallback-to-local path)", async () => {
+    const { queryPgvectorRpc } = await import("@/lib/rag/retriever");
+    failNextRpc = true;
+    let threw = false;
+    try {
+      await queryPgvectorRpc({ url: baseUrl, serviceKey: "k" }, "u", [0.1]);
+    } catch (e) {
+      threw = true;
+      ok(String(e).includes("match_rag_chunks 500"), `error should carry status: ${e}`);
+    }
+    ok(threw, "500 must throw — retrieveChunks catches it and degrades to local");
+  });
+
+  await test("mirrorChunksToPgvector posts rows with service key + merge-duplicates", async () => {
+    await withSupabaseEnv(async () => {
+      const { mirrorChunksToPgvector } = await import("@/lib/rag/retriever");
+      calls.length = 0;
+      const mirrored = await mirrorChunksToPgvector("user-1", "doc-9", "PG Doc", [
+        { id: "c1", chunkIndex: 0, content: "alpha", embedding: [0.1, 0.2] },
+        { id: "c2", chunkIndex: 1, content: "beta", embedding: [0.3, 0.4] },
+      ]);
+      ok(mirrored === true, "mirror should report success");
+      const call = calls.find((c) => c.path === "/rest/v1/rag_chunks" && c.method === "POST");
+      ok(call, "should POST to rag_chunks");
+      eq(call!.headers.apikey, "test-service-key");
+      eq(call!.headers.prefer, "resolution=merge-duplicates", "idempotent upsert on re-ingest");
+      const rows = call!.body as Array<Record<string, unknown>>;
+      eq(rows.length, 2);
+      eq(rows[0].user_id, "user-1");
+      eq(rows[1].chunk_index, 1);
+      eq(rows[0].document_title, "PG Doc");
+    });
+  });
+
+  await test("removeDocumentFromPgvector deletes by document_id filter", async () => {
+    await withSupabaseEnv(async () => {
+      const { removeDocumentFromPgvector } = await import("@/lib/rag/retriever");
+      calls.length = 0;
+      const removed = await removeDocumentFromPgvector("doc-9");
+      ok(removed === true);
+      const call = calls.find((c) => c.method === "DELETE");
+      ok(call, "should send DELETE");
+      ok(call!.query.includes("document_id=eq.doc-9"), `filter missing: ${call!.query}`);
+    });
+  });
+
+  mock.stop(true);
+}
+
+// ---------------------------------------------------------------------
 // Summary
 // ---------------------------------------------------------------------
 

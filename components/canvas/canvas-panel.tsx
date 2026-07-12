@@ -46,11 +46,17 @@ export function CanvasPanel({
   const [source, setSource] = React.useState(state?.source ?? defaultHtml);
   const [saving, setSaving] = React.useState(false);
 
+  // Sync incoming state → editor. Deferred a microtask so no setState
+  // runs synchronously in the effect body (react-hooks/set-state-in-effect).
   React.useEffect(() => {
-    if (state) {
+    if (!state) return;
+    let cancelled = false;
+    queueMicrotask(() => {
+      if (cancelled) return;
       setKind(state.kind);
       setSource(state.source);
-    }
+    });
+    return () => { cancelled = true; };
   }, [state]);
 
   // Load most recent snapshot when the panel opens for an existing chat
@@ -86,7 +92,6 @@ export function CanvasPanel({
       }
     })();
     return () => { cancelled = true; };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, chatId]);
 
   const sandboxDoc = React.useMemo(() => {

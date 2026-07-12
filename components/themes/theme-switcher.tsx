@@ -21,8 +21,15 @@ import { THEMES, applyTheme, loadPersistedTheme, type ThemeDefinition } from "@/
 export function ThemeSwitcher({ open, onOpenChange }: { open: boolean; onOpenChange: (v: boolean) => void }) {
   const [active, setActive] = React.useState<string>("obsidian");
 
+  // Read the persisted theme after mount (localStorage is client-only).
+  // Deferred a microtask so no setState runs synchronously in the
+  // effect body (react-hooks/set-state-in-effect).
   React.useEffect(() => {
-    setActive(loadPersistedTheme());
+    let cancelled = false;
+    queueMicrotask(() => {
+      if (!cancelled) setActive(loadPersistedTheme());
+    });
+    return () => { cancelled = true; };
   }, []);
 
   function handleSelect(theme: ThemeDefinition) {

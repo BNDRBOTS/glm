@@ -50,6 +50,18 @@ function isAccepted(file: File): boolean {
   return ALLOWED_EXT.has(ext);
 }
 
+/** Pure fetch helper — no state access, shared by effect + handlers. */
+async function fetchDocumentsList(): Promise<DocumentRow[] | null> {
+  try {
+    const r = await fetch("/api/documents");
+    if (!r.ok) return null;
+    const j = await r.json();
+    return Array.isArray(j.documents) ? j.documents : null;
+  } catch {
+    return null;
+  }
+}
+
 export function DocumentsPanel({
   open,
   onOpenChange,
@@ -67,21 +79,23 @@ export function DocumentsPanel({
   const inputRef = React.useRef<HTMLInputElement>(null);
 
   const refresh = React.useCallback(async () => {
-    try {
-      const r = await fetch("/api/documents");
-      if (!r.ok) return;
-      const j = await r.json();
-      if (Array.isArray(j.documents)) setDocuments(j.documents);
-    } catch {
-      // panel shows previous state
-    } finally {
-      setLoading(false);
-    }
+    const docs = await fetchDocumentsList();
+    if (docs) setDocuments(docs); // on failure the panel shows previous state
+    setLoading(false);
   }, []);
 
+  // State updates only in promise callbacks — never synchronously in
+  // the effect body (react-hooks/set-state-in-effect).
   React.useEffect(() => {
-    if (open) refresh();
-  }, [open, refresh]);
+    if (!open) return;
+    let cancelled = false;
+    fetchDocumentsList().then((docs) => {
+      if (cancelled) return;
+      if (docs) setDocuments(docs);
+      setLoading(false);
+    });
+    return () => { cancelled = true; };
+  }, [open]);
 
   async function handleUpload(file: File) {
     if (!isAccepted(file)) {

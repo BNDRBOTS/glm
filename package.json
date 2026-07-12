@@ -8,6 +8,7 @@
     "start": "NODE_ENV=production bun .next/standalone/server.js 2>&1 | tee server.log",
     "lint": "eslint .",
     "test": "bun --preload ./tests/preload.ts ./tests/index.ts",
+    "e2e": "node scripts/e2e.mjs",
     "type-check": "tsc --noEmit",
     "postinstall": "prisma generate",
     "prebuild": "node scripts/swap-prisma-provider.mjs && prisma generate",

@@ -28,12 +28,17 @@ export function CommandPalette({
   const [query, setQuery] = React.useState("");
   const [activeIdx, setActiveIdx] = React.useState(0);
 
-  // Reset on open
+  // Reset on open — deferred a microtask so no setState runs
+  // synchronously in the effect body (react-hooks/set-state-in-effect).
   React.useEffect(() => {
-    if (open) {
+    if (!open) return;
+    let cancelled = false;
+    queueMicrotask(() => {
+      if (cancelled) return;
       setQuery("");
       setActiveIdx(0);
-    }
+    });
+    return () => { cancelled = true; };
   }, [open]);
 
   const filtered = React.useMemo(() => {

@@ -49,6 +49,21 @@ const LEVEL_COLORS: Record<string, string> = {
   debug: "text-muted-foreground",
 };
 
+/** Pure fetch helper — no state access, shared by effect + handlers. */
+async function queryLogs(filterSource: string, filterLevel: string): Promise<AuditLogRow[]> {
+  try {
+    const params = new URLSearchParams();
+    if (filterSource) params.set("source", filterSource);
+    if (filterLevel) params.set("level", filterLevel);
+    params.set("limit", "200");
+    const r = await fetch(`/api/audit?${params}`);
+    const j = await r.json();
+    return j.rows ?? [];
+  } catch {
+    return [];
+  }
+}
+
 export function LogsPanel({ open, onOpenChange }: LogsPanelProps) {
   const [logs, setLogs] = React.useState<AuditLogRow[]>([]);
   const [filterSource, setFilterSource] = React.useState<string>("");
@@ -58,24 +73,26 @@ export function LogsPanel({ open, onOpenChange }: LogsPanelProps) {
 
   const fetchLogs = React.useCallback(async () => {
     setLoading(true);
-    try {
-      const params = new URLSearchParams();
-      if (filterSource) params.set("source", filterSource);
-      if (filterLevel) params.set("level", filterLevel);
-      params.set("limit", "200");
-      const r = await fetch(`/api/audit?${params}`);
-      const j = await r.json();
-      setLogs(j.rows ?? []);
-    } catch {
-      setLogs([]);
-    } finally {
-      setLoading(false);
-    }
+    setLogs(await queryLogs(filterSource, filterLevel));
+    setLoading(false);
   }, [filterSource, filterLevel]);
 
+  // Refetch on open + filter changes. State updates only in async
+  // callbacks — never synchronously in the effect body
+  // (react-hooks/set-state-in-effect).
   React.useEffect(() => {
-    if (open) fetchLogs();
-  }, [open, fetchLogs]);
+    if (!open) return;
+    let cancelled = false;
+    queueMicrotask(() => {
+      if (!cancelled) setLoading(true);
+    });
+    queryLogs(filterSource, filterLevel).then((rows) => {
+      if (cancelled) return;
+      setLogs(rows);
+      setLoading(false);
+    });
+    return () => { cancelled = true; };
+  }, [open, filterSource, filterLevel]);
 
   function toggleExpanded(id: string) {
     setExpanded((prev) => {

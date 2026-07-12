@@ -40,6 +40,7 @@ A cloud-deployed chat platform with: GLM 5.2 + DeepSeek streaming (visible reaso
 - **Dual retrieval drivers**: `local` (default — exact cosine over Prisma-stored vectors, SQLite + Postgres, zero infra) and `supabase` (optional pgvector HNSW accelerator, `m=16/ef_construction=64/ef_search=100`, auto-fallback to local on any failure)
 - Every RAG turn injects matched chunks as numbered `[Source N]` excerpts with a citation instruction; the answer cites them and the UI renders source chips (title + similarity % + snippet on hover)
 - **Docs toggle** in the composer — RAG on by default, no-ops instantly at zero documents
+- **Attachment → RAG bridge**: attach a PDF/DOCX/XLSX/TXT/MD to a chat message and it auto-ingests BEFORE retrieval — the very turn it arrives on can cite it (ragdb's upload-then-ask flow collapsed into one step). Deduped by filename + size, gated by the Docs toggle, never fatal to the turn
 - Document lifecycle: `processing → ready | error` with the failure reason surfaced in the library; deletes cascade chunks + stored file + pgvector mirror
 - Multi-tenant isolation: every query scoped by the authenticated user id; no unscoped retrieval path exists; ragdb's original RLS/auth.uid() schema preserved under `supabase/migrations/`
 - RAG works with the quality checker, mode gates, skills, and tool calls — retrieval context rides in the same system-prefix stack
@@ -189,8 +190,30 @@ Nothing from either platform was dropped. Feature-by-feature mapping from the ra
 | Source chips on answers | `SourcesRow` in `components/chat/message.tsx` | Title + similarity % + snippet on hover, persisted per message |
 | Documents library UI (upload zone + list) | `components/documents/documents-panel.tsx` | Drag & drop, status dots, chunk counts, delete |
 | `X-Accel-Buffering: no`, `maxDuration = 300` | `/api/chat`, `/api/documents` | SSE + long-ingest hardening ported |
-| Multi-tenant isolation | userId-scoped Prisma queries + server-only pgvector RPC | No unscoped retrieval path exists (tested) |
+| Multi-tenant isolation | userId-scoped Prisma queries + server-only pgvector RPC | No unscoped retrieval path exists (tested); two-user isolation proven live by `bun run e2e` |
 | Tuning constants co-located with code | `lib/rag/*` (see RAG tuning table) | ragdb convention kept |
+| Upload-then-ask UX | Attachment → RAG bridge in `/api/chat` | Collapsed into ONE step: attaching a supported file makes it citable on the same turn |
+
+### The ragdb login defect — root cause and resolution
+
+ragdb's README promised "Supabase Auth (email/password)", but both auth pages
+implemented **magic-link OTP only** (`signInWithOtp`) — no password path
+existed. Sign-in therefore depended on (1) email delivery, which Supabase's
+built-in sender rate-limits severely without custom SMTP, and (2) same-browser
+PKCE state: opening the emailed link on another device/browser makes
+`exchangeCodeForSession` fail. The error page mapped `reason` codes the
+callback never set, so every failure surfaced as "an unexpected authentication
+error". Net effect: users frequently could not log in, with no diagnosable
+cause.
+
+The merged platform resolves the defect **structurally**: NextAuth credentials
+auth (bcrypt-style hashed passwords, JWT sessions) — zero email dependency,
+zero cross-device state, plus per-IP signup/sign-in rate limiting and explicit
+error surfaces. Proven live by `bun run e2e` phase B: signup → CSRF →
+credentials callback → session cookie → per-user data access, wrong-password
+rejection, and two-user isolation — with no email infrastructure configured at
+all. (Magic-link support can still be added later as an additional NextAuth
+provider; it is not a load-bearing dependency anywhere.)
 
 ## Slots ready for later (not built — by design)
 
@@ -300,10 +323,20 @@ Env switches: `RAG_EMBEDDINGS_PROVIDER` (auto/openai/zai/local), `RAG_DRIVER` (l
 ## Running tests
 
 ```bash
-bun run test
+bun run test   # 95 unit tests (~seconds, no server, no keys)
+bun run e2e    # 57 live end-to-end checks (boots the dev server itself, no keys)
 ```
 
-Runs 91 smoke + sanity + WCAG + RAG tests covering:
+`bun run e2e` is fully self-orchestrating: it pushes a fresh SQLite schema,
+boots the dev server, exercises every merged path (all 4 document formats,
+failure paths, RAG-grounded SSE with cited sources, attachment auto-ingest
+with same-turn citation + dedupe, multi-turn history, multi-chunk recall,
+raw-export integrity, real signup/sign-in, two-user isolation, the signup
+rate limiter, wrong-password rejection), then RESTARTS the server with a
+deliberately broken pgvector config to prove persistence, JWT session
+survival, and automatic degradation to the local retrieval driver.
+
+The unit suite (95 tests) covers:
 - Models catalog (no 4.6, has 5.1 + flash)
 - Connectors registry (6 connectors, CourtListener + Midpage manifests)
 - Backends registry (5 backends, Supabase required fields)
@@ -324,6 +357,7 @@ Runs 91 smoke + sanity + WCAG + RAG tests covering:
 - RAG parsers (txt/md/xlsx round-trip, REAL handcrafted-PDF extraction via unpdf, corrupt-PDF failure path, MIME/extension resolution)
 - AI providers (5-model catalog, provider routing, DeepSeek strict-alternation message builder, per-provider key detection)
 - RAG security (no unscoped retrieval, ingest input validation, driver config gating)
+- pgvector driver against a mock PostgREST server (RPC request shape + service-key auth, snake_case→camelCase mapping, 500→fallback error path, mirror upsert with merge-duplicates, delete-by-document filter)
 
 ## Quick start
 

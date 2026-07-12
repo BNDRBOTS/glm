@@ -74,32 +74,42 @@ interface BillingPanelProps {
   billingConfigured: boolean;
 }
 
+/** Pure fetch helper — no state access, used by the open-effect. */
+async function fetchBillingGroups(): Promise<{ id: string; name: string; stripeSubscriptionId?: string | null }[]> {
+  try {
+    const r = await fetch("/api/groups");
+    const j = await r.json();
+    return (j.groups ?? []).map((g: any) => ({
+      id: g.id,
+      name: g.name,
+      stripeSubscriptionId: g.stripeSubscriptionId,
+    }));
+  } catch {
+    return [];
+  }
+}
+
 export function BillingPanel({ open, onOpenChange, billingConfigured }: BillingPanelProps) {
   const [groups, setGroups] = React.useState<{ id: string; name: string; stripeSubscriptionId?: string | null }[]>([]);
   const [loading, setLoading] = React.useState(false);
   const [redirecting, setRedirecting] = React.useState<string | null>(null);
   const { toast } = useToast();
 
-  const refresh = React.useCallback(async () => {
-    setLoading(true);
-    try {
-      const r = await fetch("/api/groups");
-      const j = await r.json();
-      setGroups((j.groups ?? []).map((g: any) => ({
-        id: g.id,
-        name: g.name,
-        stripeSubscriptionId: g.stripeSubscriptionId,
-      })));
-    } catch {
-      setGroups([]);
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
+  // State updates only in async callbacks — never synchronously in
+  // the effect body (react-hooks/set-state-in-effect).
   React.useEffect(() => {
-    if (open) refresh();
-  }, [open, refresh]);
+    if (!open) return;
+    let cancelled = false;
+    queueMicrotask(() => {
+      if (!cancelled) setLoading(true);
+    });
+    fetchBillingGroups().then((groups) => {
+      if (cancelled) return;
+      setGroups(groups);
+      setLoading(false);
+    });
+    return () => { cancelled = true; };
+  }, [open]);
 
   async function handleCheckout(planId: string, groupId: string) {
     setRedirecting(`${planId}:${groupId}`);
@@ -111,7 +121,7 @@ export function BillingPanel({ open, onOpenChange, billingConfigured }: BillingP
       });
       const j = await r.json();
       if (j.url) {
-        window.location.href = j.url;
+        window.location.assign(j.url);
         return;
       }
       toast({
@@ -136,7 +146,7 @@ export function BillingPanel({ open, onOpenChange, billingConfigured }: BillingP
       });
       const j = await r.json();
       if (j.url) {
-        window.location.href = j.url;
+        window.location.assign(j.url);
         return;
       }
       toast({

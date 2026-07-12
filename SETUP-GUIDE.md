@@ -374,6 +374,25 @@ pgvector HNSW index:
 If the accelerator ever fails, retrieval silently falls back to the
 local driver (audited) — chat never breaks.
 
+### Attach-and-ask (no Documents panel needed)
+
+Attaching a PDF/DOCX/XLSX/TXT/MD to a chat message auto-indexes it
+before the model answers — the same turn can already cite it. The file
+also appears in the Documents panel afterward. Re-sending the same
+file is deduped. Chat attachments cap at 10 MB; the Documents panel
+accepts up to 50 MB.
+
+### Verifying your install
+
+```bash
+bun run test   # 95 unit tests — no server, no keys
+bun run e2e    # 57 live checks — boots the dev server itself, no keys
+```
+
+The e2e run covers ingestion of all four formats, cited retrieval,
+attachment auto-ingest, real signup/sign-in, two-user isolation, and a
+server restart that proves persistence + pgvector fallback.
+
 ### RAG troubleshooting
 
 - **"Docs" toggle seems to do nothing**: you have no documents in

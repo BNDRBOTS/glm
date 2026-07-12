@@ -28,7 +28,7 @@ import { db } from "@/lib/db";
 import { getGLMClient, type ChatTurn } from "@/lib/ai/client";
 import { logTurn } from "@/lib/memory";
 import { getCurrentUserId } from "@/lib/auth/nextauth";
-import { isDemoModeAllowed, DEMO_USER_ID } from "@/lib/auth/require-user";
+import { isDemoModeAllowed, DEMO_USER_ID, ensureUserRow } from "@/lib/auth/require-user";
 import { parseMode, modeGate, type ChatMode } from "@/lib/permissions/modes";
 import { checkAndRetry } from "@/lib/quality/checker";
 import { initState, distillTurn, type DistillationState } from "@/lib/distillation";
@@ -42,6 +42,8 @@ import {
 } from "@/lib/tools/connector-calls";
 import { listConnectors } from "@/lib/connectors/registry";
 import { buildRagContext } from "@/lib/rag/pipeline";
+import { resolveMimeType } from "@/lib/rag/parsers";
+import { ingestDocument } from "@/lib/rag/ingest";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -130,12 +132,87 @@ export async function POST(req: NextRequest) {
   const visibleConnectors = allConnectors.filter((c) => credentialedConnectorIds.has(c.id));
   const toolCallPrefix = buildToolCallSystemPrefix(skillAllowedConnectors, visibleConnectors);
 
+  // Decode attachments ONCE up front. The same buffers feed both the
+  // RAG auto-ingest below and the Attachment persistence later —
+  // validation (empty / oversized / malformed base64) happens here.
+  const decodedAttachments: { filename: string; mimeType: string; buffer: Buffer }[] = [];
+  if (attachments && attachments.length > 0) {
+    for (const att of attachments) {
+      if (!att.filename || !att.data) continue;
+      let buf: Buffer;
+      try {
+        buf = Buffer.from(att.data, "base64");
+      } catch {
+        continue; // skip malformed
+      }
+      if (buf.length === 0 || buf.length > MAX_ATTACHMENT_BYTES) continue;
+      decodedAttachments.push({ filename: att.filename, mimeType: att.mimeType, buffer: buf });
+    }
+  }
+
+  // Materialize the user row before any FK writes (demo mode only —
+  // real users always exist). Replaces the old inline demo upsert.
+  await ensureUserRow(effectiveUserId);
+
+  // Attachment → RAG bridge (merge completion): attachments in a
+  // RAG-supported format are auto-ingested BEFORE retrieval, so the
+  // very turn they arrive on can cite them — ragdb's upload-then-ask
+  // flow collapsed into one step. Gated by the Docs toggle; deduped
+  // by (filename, size) against live documents; never fatal to the
+  // chat turn. Chat attachments are capped at 10 MB by this route
+  // (the Documents panel allows the full 50 MB).
+  const isRagEnabled = ragEnabled !== false;
+  if (isRagEnabled && decodedAttachments.length > 0) {
+    for (const att of decodedAttachments) {
+      const ragMime = resolveMimeType(att.filename, att.mimeType);
+      if (!ragMime) continue; // not a documents-pipeline format — stays a plain attachment
+      try {
+        const existing = await db.document.findFirst({
+          where: {
+            userId: effectiveUserId,
+            title: att.filename,
+            fileSize: att.buffer.length,
+            status: { in: ["processing", "ready"] },
+          },
+          select: { id: true },
+        });
+        if (existing) continue; // same file already indexed — don't duplicate
+        const result = await ingestDocument(effectiveUserId, {
+          filename: att.filename,
+          mimeType: ragMime,
+          buffer: att.buffer,
+          title: att.filename,
+        });
+        await logAudit({
+          userId: effectiveUserId,
+          source: "rag",
+          level: result.status === "ready" ? "info" : "warn",
+          event: "document.auto_ingested_from_chat",
+          payload: {
+            filename: att.filename,
+            documentId: result.documentId,
+            status: result.status,
+            chunkCount: result.chunkCount,
+            error: result.error,
+          },
+        });
+      } catch (e) {
+        await logAudit({
+          userId: effectiveUserId,
+          source: "rag",
+          level: "warn",
+          event: "document.auto_ingest_failed",
+          payload: { filename: att.filename, error: String(e) },
+        });
+      }
+    }
+  }
+
   // RAG retrieval (merged from ragdb). Runs before the stream so the
   // matched excerpts ride in the system prefix of the FIRST pass —
   // the quality checker and mode gate then operate on document-
   // grounded output. buildRagContext never throws; empty results
   // yield a null prompt and RAG becomes a no-op for this turn.
-  const isRagEnabled = ragEnabled !== false;
   const ragContext = isRagEnabled
     ? await buildRagContext(effectiveUserId, text)
     : null;
@@ -159,21 +236,6 @@ export async function POST(req: NextRequest) {
   // Combine skill system prompt + RAG context + tool-call prefix.
   const combinedSystemPrefix =
     [skillSystemPrompt, ragSystemPrompt, toolCallPrefix].filter(Boolean).join("\n\n") || null;
-
-  // Auto-create demo user if needed (only in demo mode)
-  if (!userId && enableDemo) {
-    await db.user.upsert({
-      where: { id: "demo-user" },
-      create: {
-        id: "demo-user",
-        email: "demo@local",
-        name: "Demo",
-        passwordHash: "demo-no-auth",
-        role: "OWNER",
-      },
-      update: {},
-    });
-  }
 
   // Find or create chat — with ownership / group-membership check.
   // Pattern: resolve `chat` exactly once (either found or created),
@@ -243,41 +305,31 @@ export async function POST(req: NextRequest) {
   });
 
   // Persist attachments (if any) and link them to the user message.
-  // The composer sends each as { filename, mimeType, data } where data
-  // is base64-encoded. We decode + store to disk + record the row.
-  if (attachments && attachments.length > 0) {
-    for (const att of attachments) {
-      if (!att.filename || !att.data) continue;
-      let buf: Buffer;
-      try {
-        buf = Buffer.from(att.data, "base64");
-      } catch {
-        continue; // skip malformed
-      }
-      if (buf.length === 0 || buf.length > MAX_ATTACHMENT_BYTES) continue;
-      try {
-        const stored = await storeAttachment(att.filename, att.mimeType, buf);
-        await db.attachment.create({
-          data: {
-            chatId: activeChat.id,
-            messageId: userMsg.id,
-            filename: stored.filename,
-            mimeType: stored.mimeType,
-            size: stored.size,
-            storage: stored.storage,
-            storageKey: stored.storageKey,
-          },
-        });
-      } catch (e) {
-        // Log but don't fail the whole turn for one bad attachment.
-        await logAudit({
-          userId: effectiveUserId,
-          source: "system",
-          level: "warn",
-          event: "attachment.store_failed",
-          payload: { chatId: activeChat.id, messageId: userMsg.id, filename: att.filename, error: String(e) },
-        });
-      }
+  // Buffers were decoded + validated once, up front (they also fed
+  // the RAG auto-ingest); here they're stored to disk + recorded.
+  for (const att of decodedAttachments) {
+    try {
+      const stored = await storeAttachment(att.filename, att.mimeType, att.buffer);
+      await db.attachment.create({
+        data: {
+          chatId: activeChat.id,
+          messageId: userMsg.id,
+          filename: stored.filename,
+          mimeType: stored.mimeType,
+          size: stored.size,
+          storage: stored.storage,
+          storageKey: stored.storageKey,
+        },
+      });
+    } catch (e) {
+      // Log but don't fail the whole turn for one bad attachment.
+      await logAudit({
+        userId: effectiveUserId,
+        source: "system",
+        level: "warn",
+        event: "attachment.store_failed",
+        payload: { chatId: activeChat.id, messageId: userMsg.id, filename: att.filename, error: String(e) },
+      });
     }
   }
 
@@ -399,7 +451,12 @@ export async function POST(req: NextRequest) {
                   { model: effectiveModel, messages: retryMsgs, temperature: 0.5 },
                   {
                     onToken: (t) => { if (!aborted) send({ type: "token", token: t }); },
-                    onDone: (f) => { retryFull = f; },
+                    onThinkingToken: (t) => { if (!aborted) send({ type: "thinking", token: t }); },
+                    onDone: (f, thinking) => {
+                      retryFull = f;
+                      // Retry reasoning appends to the turn's trace.
+                      if (thinking) fullThinking += (fullThinking ? "\n\n" : "") + thinking;
+                    },
                     onError: (e) => send({ type: "error", error: e.message }),
                   }
                 );
@@ -537,7 +594,11 @@ export async function POST(req: NextRequest) {
             },
             {
               onToken: (t) => { if (!aborted) send({ type: "token", token: t }); },
-              onDone: (f) => { synthesisFull = f; },
+              onThinkingToken: (t) => { if (!aborted) send({ type: "thinking", token: t }); },
+              onDone: (f, thinking) => {
+                synthesisFull = f;
+                if (thinking) fullThinking += (fullThinking ? "\n\n" : "") + thinking;
+              },
               onError: (e) => send({ type: "error", error: e.message }),
             }
           );

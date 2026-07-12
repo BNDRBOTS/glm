@@ -153,22 +153,32 @@ export async function exportRaw(chatId: string) {
   return {
     chatId,
     exportedAt: new Date().toISOString(),
-    messages: messages.map((m) => ({
-      id: m.id,
-      role: m.role,
-      content: m.content,
-      model: m.model,
-      tokens: {
-        prompt: m.promptTokens,
-        completion: m.completionTokens,
-        total: m.totalTokens,
-      },
-      attachments: m.attachments.map((a) => ({
-        filename: a.filename,
-        mimeType: a.mimeType,
-        size: a.size,
-      })),
-      createdAt: m.createdAt,
-    })),
+    messages: messages.map((m) => {
+      // RAG source citations are stored as a JSON string — decode for
+      // the export so "every message verbatim" includes them as data.
+      let sources: unknown = null;
+      if (m.sources) {
+        try { sources = JSON.parse(m.sources); } catch { sources = m.sources; }
+      }
+      return {
+        id: m.id,
+        role: m.role,
+        content: m.content,
+        model: m.model,
+        thinking: m.thinking,
+        sources,
+        tokens: {
+          prompt: m.promptTokens,
+          completion: m.completionTokens,
+          total: m.totalTokens,
+        },
+        attachments: m.attachments.map((a) => ({
+          filename: a.filename,
+          mimeType: a.mimeType,
+          size: a.size,
+        })),
+        createdAt: m.createdAt,
+      };
+    }),
   };
 }

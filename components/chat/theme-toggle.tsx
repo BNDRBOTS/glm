@@ -4,10 +4,13 @@ import * as React from "react";
 import { useTheme } from "next-themes";
 import { cn } from "@/lib/utils";
 
+// Hydration-safe mounted flag: false during SSR/hydration, true on the
+// client — without a setState-in-effect (react-hooks/set-state-in-effect).
+const emptySubscribe = () => () => {};
+
 export function ThemeToggle({ className }: { className?: string }) {
   const { theme, setTheme } = useTheme();
-  const [mounted, setMounted] = React.useState(false);
-  React.useEffect(() => setMounted(true), []);
+  const mounted = React.useSyncExternalStore(emptySubscribe, () => true, () => false);
 
   const isDark = theme === "dark";
 
