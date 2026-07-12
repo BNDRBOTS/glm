@@ -15,6 +15,7 @@
  *   skill        — skill created/imported/applied/deleted
  *   auth         — sign in, sign out, account created
  *   system       — startup, config errors, health
+ *   rag          — document ingest lifecycle + retrieval events
  *
  * Levels: info | warn | error | debug
  *
@@ -35,7 +36,8 @@ export type AuditSource =
   | "billing"
   | "skill"
   | "auth"
-  | "system";
+  | "system"
+  | "rag";
 
 export type AuditLevel = "info" | "warn" | "error" | "debug";
 

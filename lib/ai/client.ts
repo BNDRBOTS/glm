@@ -1,27 +1,36 @@
 /**
- * GLM Power Platform — AI Client Wrapper
+ * AI Client Wrapper — multi-provider (Z.ai GLM + DeepSeek). SERVER-ONLY.
  * ---------------------------------------------------------------------
- * Single entry point to talk to GLM models. SERVER-ONLY.
+ * Single entry point for streaming chat. The model catalog declares
+ * which provider each model belongs to; this client routes the call:
  *
- * Drop-in pattern for the user:
- *   1. Get a Z.ai API key at https://z.ai (or open.bigmodel.cn)
- *   2. Put it in .env as ZAI_API_KEY=...
- *   3. Done. This client picks it up automatically.
+ *   zai      — https://api.z.ai/api/paas/v4  (ZAI_API_KEY)
+ *   deepseek — https://api.deepseek.com/v1   (DEEPSEEK_API_KEY)
  *
- * Future hooks (already structured, no implementation needed now):
- *   - Behavioral wrappers can transform `messages` before send
+ * Both APIs are OpenAI-compatible SSE streams. Reasoning tokens
+ * (delta.reasoning_content — emitted by deepseek-reasoner AND by
+ * thinking-enabled GLM models) surface through onThinkingToken and
+ * are kept strictly separate from content.
+ *
+ * DeepSeek's reasoner requires strictly alternating user/assistant
+ * turns after the system message. buildProviderMessages() (ported
+ * from ragdb's stream route) merges consecutive same-role turns and
+ * folds stray system/tool turns so the API never 400s.
+ *
+ * Future hooks (already structured):
+ *   - Behavioral wrappers transform `messages` before send
  *   - Memory mesh can prepend semantic context to `messages`
  *   - Tool/integration calls can be appended to `tools`
  *
- * Calls the Z.ai API directly (OpenAI-compatible) — no SDK config file
- * dance, works with just an env var.
- *
- * Falls back to a deterministic mock stream when no API key is set,
- * so the UI is fully usable during local preview / setup.
+ * Falls back to a deterministic mock stream when the provider's key
+ * is not set in dev/preview, so the UI is fully usable during setup.
+ * In production a missing key fails loudly — mock text that looks
+ * like a real LLM response is the worst failure mode for a paid
+ * product.
  */
 
 import "@/lib/server-guard";
-import { getModel } from "./models";
+import { getModel, getProviderForModel, type ModelProvider } from "./models";
 
 export interface ChatTurn {
   role: "user" | "assistant" | "system" | "tool";
@@ -31,12 +40,14 @@ export interface ChatTurn {
 
 export interface StreamCallbacks {
   onToken?: (token: string) => void;
+  /** Reasoning-trace tokens (deepseek-reasoner / GLM thinking). */
+  onThinkingToken?: (token: string) => void;
   onUsage?: (usage: {
     promptTokens: number;
     completionTokens: number;
     totalTokens: number;
   }) => void;
-  onDone?: (full: string) => void;
+  onDone?: (full: string, fullThinking?: string) => void;
   onError?: (err: Error) => void;
 }
 
@@ -49,48 +60,110 @@ export interface ChatRequest {
   tools?: unknown;
   systemPrefix?: string;
   systemSuffix?: string;
-  // GLM 5.2 reasoning toggle — on by default for peak tier
+  // Reasoning toggle — on by default for reasoning-capable models
   thinking?: boolean;
 }
 
-const ZAI_BASE_URL = "https://api.z.ai/api/paas/v4";
+const PROVIDER_CONFIG: Record<
+  ModelProvider,
+  { baseUrl: string; envKey: string; label: string }
+> = {
+  zai: {
+    baseUrl: "https://api.z.ai/api/paas/v4",
+    envKey: "ZAI_API_KEY",
+    label: "Z.ai",
+  },
+  deepseek: {
+    baseUrl: "https://api.deepseek.com/v1",
+    envKey: "DEEPSEEK_API_KEY",
+    label: "DeepSeek",
+  },
+};
 
-export class GLMClient {
-  private apiKey: string | null;
-  private hasKey: boolean;
+export function isProviderConfigured(provider: ModelProvider): boolean {
+  const key = process.env[PROVIDER_CONFIG[provider].envKey];
+  return Boolean(key && key.length > 0);
+}
 
-  constructor() {
-    const key = process.env.ZAI_API_KEY;
-    this.hasKey = Boolean(key && key.length > 0);
-    this.apiKey = this.hasKey ? key! : null;
+/**
+ * Normalize a message list for a provider. Ported from ragdb's
+ * buildMessages: leading system turns are merged into one system
+ * message; for DeepSeek the remaining turns are forced into strict
+ * user/assistant alternation (consecutive same-role turns merged,
+ * non-leading system/tool turns folded into user turns, leading
+ * assistant turns dropped). Z.ai accepts the list as-is.
+ */
+export function buildProviderMessages(
+  provider: ModelProvider,
+  messages: ChatTurn[]
+): ChatTurn[] {
+  // Collect leading system content into a single system turn.
+  const systemParts: string[] = [];
+  let i = 0;
+  while (i < messages.length && messages[i].role === "system") {
+    systemParts.push(messages[i].content);
+    i++;
+  }
+  const rest = messages.slice(i);
+  const system: ChatTurn[] = systemParts.length
+    ? [{ role: "system", content: systemParts.join("\n\n") }]
+    : [];
+
+  if (provider !== "deepseek") {
+    return [...system, ...rest];
   }
 
+  // DeepSeek: strict alternation. Fold system/tool turns into user
+  // turns, merge consecutive same-role turns, drop a leading
+  // assistant turn (the API requires the first non-system to be user).
+  const merged: ChatTurn[] = [];
+  for (const turn of rest) {
+    const role: "user" | "assistant" =
+      turn.role === "assistant" ? "assistant" : "user";
+    const content =
+      turn.role === "system" || turn.role === "tool"
+        ? `[${turn.role}]\n${turn.content}`
+        : turn.content;
+    const last = merged[merged.length - 1];
+    if (last && last.role === role) {
+      last.content += "\n\n" + content;
+    } else {
+      merged.push({ role, content });
+    }
+  }
+  while (merged.length > 0 && merged[0].role !== "user") merged.shift();
+
+  return [...system, ...merged];
+}
+
+export class GLMClient {
   get isConfigured() {
-    return this.hasKey;
+    // Back-compat: "configured" historically meant the Z.ai key.
+    return isProviderConfigured("zai");
   }
 
   /**
    * Streaming chat. Yields tokens via callbacks.
-   * Returns the full text once done.
+   * Returns the full content text once done.
    */
   async stream(req: ChatRequest, cbs: StreamCallbacks): Promise<string> {
     const model = getModel(req.model);
-    const finalMessages = this.applyWrappers(req);
+    const provider = getProviderForModel(req.model);
+    const config = PROVIDER_CONFIG[provider];
+    const finalMessages = buildProviderMessages(provider, this.applyWrappers(req));
 
-    if (!this.isConfigured) {
-      // In production, mock streaming is forbidden — it silently feeds
-      // the user fake text that looks like a real LLM response, which
-      // is the worst possible failure mode for a paid product. Fail
-      // loudly so the operator notices immediately.
+    if (!isProviderConfigured(provider)) {
       if (process.env.NODE_ENV === "production") {
         const err = new Error(
-          "ZAI_API_KEY is not configured. Live chat is unavailable — set ZAI_API_KEY in the environment."
+          `${config.envKey} is not configured. Live chat on ${config.label} is unavailable — set ${config.envKey} in the environment.`
         );
         cbs.onError?.(err);
         throw err;
       }
       return this.mockStream(req, cbs);
     }
+
+    const apiKey = process.env[config.envKey]!;
 
     try {
       const body: Record<string, unknown> = {
@@ -100,27 +173,32 @@ export class GLMClient {
         max_tokens: req.maxTokens ?? model?.maxOutput ?? 8_000,
         stream: true,
         stream_options: { include_usage: true },
-        thinking: { type: req.thinking === false ? "disabled" : "enabled" },
       };
+      if (provider === "zai") {
+        // Z.ai-specific reasoning toggle. DeepSeek's reasoner always
+        // thinks; its chat model never does — no parameter exists.
+        body.thinking = { type: req.thinking === false ? "disabled" : "enabled" };
+      }
 
-      const res = await fetch(`${ZAI_BASE_URL}/chat/completions`, {
+      const res = await fetch(`${config.baseUrl}/chat/completions`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          Authorization: `Bearer ${this.apiKey}`,
+          Authorization: `Bearer ${apiKey}`,
         },
         body: JSON.stringify(body),
       });
 
       if (!res.ok || !res.body) {
         const errText = await res.text().catch(() => "");
-        throw new Error(`Z.ai API ${res.status}: ${errText.slice(0, 200)}`);
+        throw new Error(`${config.label} API ${res.status}: ${errText.slice(0, 200)}`);
       }
 
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
       let full = "";
+      let fullThinking = "";
       let usage: { prompt_tokens: number; completion_tokens: number; total_tokens: number } | null = null;
 
       while (true) {
@@ -139,10 +217,16 @@ export class GLMClient {
 
           try {
             const chunk = JSON.parse(data);
-            const delta = chunk.choices?.[0]?.delta?.content ?? "";
-            if (delta) {
-              full += delta;
-              cbs.onToken?.(delta);
+            const delta = chunk.choices?.[0]?.delta ?? {};
+            const reasoning = delta.reasoning_content ?? "";
+            if (reasoning) {
+              fullThinking += reasoning;
+              cbs.onThinkingToken?.(reasoning);
+            }
+            const content = delta.content ?? "";
+            if (content) {
+              full += content;
+              cbs.onToken?.(content);
             }
             if (chunk.usage) {
               usage = chunk.usage;
@@ -161,7 +245,7 @@ export class GLMClient {
         });
       }
 
-      cbs.onDone?.(full);
+      cbs.onDone?.(full, fullThinking);
       return full;
     } catch (err) {
       const e = err instanceof Error ? err : new Error(String(err));
@@ -195,13 +279,16 @@ export class GLMClient {
    * Mock stream for preview-without-key. Streams a deterministic reply.
    */
   private async mockStream(req: ChatRequest, cbs: StreamCallbacks): Promise<string> {
+    const provider = getProviderForModel(req.model);
+    const envKey = PROVIDER_CONFIG[provider].envKey;
     const lastUser = [...req.messages].reverse().find((m) => m.role === "user");
     const userText = lastUser?.content ?? "";
     const reply = [
-      "**Preview mode** — no API key detected.\n\n",
-      "Once you drop your `ZAI_API_KEY` into `.env`, this exact interface streams live from GLM 5.2 with full token limits, maximum reasoning, and turn-by-turn JSON logging to the database.\n\n",
+      "**Preview mode** — no API key detected for this model.\n\n",
+      "Once you drop your `" + envKey + "` into `.env`, this exact interface streams live with full token limits, reasoning traces, and turn-by-turn JSON logging to the database.\n\n",
       "**You said:**\n\n> " + userText.slice(0, 400) + (userText.length > 400 ? "…" : "") + "\n\n",
       "Everything else is already wired:\n",
+      "- RAG document intelligence (upload PDFs/DOCX/XLSX — cited answers)\n",
       "- Code canvas (HTML + React preview, back button)\n",
       "- Integrations panel (Notion, GitHub, Courtroom5, Local FS — drop-in API key)\n",
       "- Memory & exports (deep aggregate + raw chat export)\n",
@@ -223,7 +310,7 @@ export class GLMClient {
       completionTokens: Math.ceil(reply.length / 4),
       totalTokens: Math.ceil((userText.length + reply.length) / 4),
     });
-    cbs.onDone?.(full);
+    cbs.onDone?.(full, "");
     return full;
   }
 }
@@ -234,3 +321,6 @@ export function getGLMClient(): GLMClient {
   if (!_client) _client = new GLMClient();
   return _client;
 }
+
+/** Provider-neutral alias — same singleton. */
+export const getAIClient = getGLMClient;

@@ -325,3 +325,66 @@ connectors, backends (real implementations), permissions, quality
 checker, distillation, skills, audit log, themes, command palette,
 dashboard, real Stripe billing, and every future expansion already
 stubbed in.
+
+---
+
+## RAG document intelligence (merged from ragdb)
+
+Chat with your documents. Upload PDFs, Word docs, spreadsheets, or plain
+text — the platform chunks, embeds, and indexes them, and every
+RAG-enabled turn performs a live similarity search and answers with
+numbered, cited sources.
+
+### Zero-setup mode (works right now)
+
+Do nothing. With no keys at all, RAG runs on deterministic **local hash
+embeddings** (256-dim, lexical-overlap grade — honest dev quality,
+labeled as `local` in the Documents panel and `/api/session`). Upload a
+file in the **Documents** panel (sidebar or ⌘K → "Open documents"), ask
+a question, watch the source chips appear.
+
+### Production mode (one key)
+
+Set `OPENAI_API_KEY` in the environment — RAG upgrades to
+`text-embedding-3-small` (1536-dim semantic vectors) automatically.
+No OpenAI key? Your existing `ZAI_API_KEY` also works
+(`RAG_EMBEDDINGS_PROVIDER=zai` or just leave it on `auto`).
+
+**Important**: documents remember which provider embedded them. If you
+add a key later, re-upload documents you want on the better provider
+(mixed-provider libraries still work — each group is searched in its
+own vector space).
+
+### DeepSeek models (optional)
+
+Set `DEEPSEEK_API_KEY` (https://platform.deepseek.com) and the model
+picker gains **DeepSeek Reasoner** (visible thinking trace, great on
+documents + math) and **DeepSeek Chat**. Reasoning tokens stream into a
+collapsible "View reasoning" panel on each answer.
+
+### pgvector accelerator (optional, large corpora)
+
+For tens of thousands of chunks, mirror vectors into a Supabase
+pgvector HNSW index:
+
+1. Run `supabase/rag/101_rag_pgvector.sql` in the Supabase SQL editor.
+2. Set `RAG_DRIVER=supabase`, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`.
+3. Use the `openai` or `zai` embedding provider (1536-dim).
+
+If the accelerator ever fails, retrieval silently falls back to the
+local driver (audited) — chat never breaks.
+
+### RAG troubleshooting
+
+- **"Docs" toggle seems to do nothing**: you have no documents in
+  `ready` status. Open Documents and check for `error` states — the
+  failure reason is shown inline.
+- **Upload returns 422**: unsupported type. Allowed: PDF, DOCX, XLSX,
+  TXT, MD (50 MB max).
+- **Answers don't cite sources**: no chunk cleared the 0.3 similarity
+  threshold for that question. On `local` embeddings this is common
+  for paraphrased questions — add `OPENAI_API_KEY` for semantic
+  retrieval.
+- **pgvector mode not activating**: `RAG_DRIVER=supabase` requires BOTH
+  `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY`; otherwise the
+  platform stays on `local` (check `/api/session` → `rag.driver`).

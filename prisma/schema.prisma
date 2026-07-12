@@ -56,6 +56,8 @@ model User {
   exports       ChatExport[]
   skills        Skill[]
   passwordResetTokens PasswordResetToken[]
+  documents     Document[]
+  documentChunks DocumentChunk[]
 }
 
 model Account {
@@ -161,6 +163,12 @@ model Message {
   totalTokens      Int?
   // Optional tool/integration metadata
   toolCalls   String?
+  // Reasoning trace (DeepSeek reasoning_content / GLM thinking tokens).
+  // Stored separately, NEVER merged into content.
+  thinking    String?
+  // RAG source citations for this turn — JSON array of
+  // { chunkId, documentId, documentTitle, chunkIndex, snippet, similarity }
+  sources     String?
   // For the canvas back-button — pointer to the previous message state
   parentMessageId String?
   createdAt   DateTime @default(now())
@@ -364,6 +372,64 @@ model Skill {
   owner        User     @relation(fields: [ownerId], references: [id], onDelete: Cascade)
 
   @@index([ownerId])
+}
+
+// ---------------------------------------------------------------------
+// RAG document store — merged from the RAG Chat platform (ragdb).
+// Documents are parsed (PDF/DOCX/XLSX/TXT/MD), chunked with a
+// sentence-boundary sliding window, embedded, and indexed per user.
+// Every chat turn with RAG enabled runs a live similarity search over
+// these chunks and injects the matches as numbered source excerpts.
+// ---------------------------------------------------------------------
+
+model Document {
+  id         String   @id @default(cuid())
+  userId     String
+  title      String
+  filename   String
+  mimeType   String
+  fileSize   Int
+  // processing | ready | error — same lifecycle as ragdb
+  status     String   @default("processing")
+  // Populated when status = error (parse/embed failure detail)
+  error      String?
+  chunkCount Int      @default(0)
+  // Which embedding provider generated this document's vectors:
+  // openai (text-embedding-3-small, 1536) | zai (embedding-3, 1536) |
+  // local (deterministic hash, 256 — dev/no-key fallback)
+  embeddingProvider String @default("local")
+  embeddingDim      Int    @default(256)
+  // Original file retained on disk (same storage layer as attachments)
+  storage    String   @default("LOCAL")
+  storageKey String
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  user   User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  chunks DocumentChunk[]
+
+  @@index([userId])
+  @@index([status])
+}
+
+model DocumentChunk {
+  id         String   @id @default(cuid())
+  documentId String
+  userId     String
+  chunkIndex Int
+  content    String
+  tokenCount Int      @default(0)
+  // JSON-encoded number[] — portable across SQLite (dev) and
+  // PostgreSQL (prod). The optional Supabase pgvector driver mirrors
+  // these vectors into an HNSW-indexed table for ANN-speed retrieval.
+  embedding  String
+  createdAt  DateTime @default(now())
+
+  document Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([documentId])
+  @@index([userId])
 }
 
 // ---------------------------------------------------------------------

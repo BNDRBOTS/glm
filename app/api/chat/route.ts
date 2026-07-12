@@ -7,7 +7,12 @@
  *   1. Auth check (or demo mode if explicitly enabled)
  *   2. Persist user message + log turn to MemoryLog
  *   3. Run distillation on user message (update intent state)
- *   4. Stream GLM response token-by-token
+ *   3b. RAG retrieval (merged from ragdb): similarity search over the
+ *       user's indexed documents; matches injected as numbered
+ *       [Source N] excerpts in the system prefix, source metadata
+ *       streamed to the client + persisted with the assistant turn.
+ *   4. Stream model response token-by-token (GLM or DeepSeek —
+ *      reasoning tokens stream separately as `thinking` events)
  *   5. Silent quality checker runs on full output
  *      - If slop detected and fullBuildOnly: retry with feedback
  *      - If intent drift: retry with intent feedback
@@ -36,9 +41,12 @@ import {
   buildToolCallSystemPrefix,
 } from "@/lib/tools/connector-calls";
 import { listConnectors } from "@/lib/connectors/registry";
+import { buildRagContext } from "@/lib/rag/pipeline";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+// Long streams + large retrieval contexts (ported from ragdb).
+export const maxDuration = 300;
 
 export async function POST(req: NextRequest) {
   const userId = await getCurrentUserId();
@@ -53,7 +61,7 @@ export async function POST(req: NextRequest) {
   }
 
   const body = await req.json();
-  const { chatId, model, text, mode, fullBuildOnly, skillId, attachments, groupId } = body as {
+  const { chatId, model, text, mode, fullBuildOnly, skillId, attachments, groupId, ragEnabled } = body as {
     chatId?: string;
     model?: string;
     text: string;
@@ -62,6 +70,9 @@ export async function POST(req: NextRequest) {
     skillId?: string;
     attachments?: { filename: string; mimeType: string; data: string }[];
     groupId?: string;
+    // RAG is on by default — retrieval no-ops instantly when the user
+    // has no indexed documents. Pass false to answer without documents.
+    ragEnabled?: boolean;
   };
 
   if (!text || typeof text !== "string") {
@@ -118,8 +129,36 @@ export async function POST(req: NextRequest) {
   const credentialedConnectorIds = new Set(userIntegrations.map((i) => i.provider));
   const visibleConnectors = allConnectors.filter((c) => credentialedConnectorIds.has(c.id));
   const toolCallPrefix = buildToolCallSystemPrefix(skillAllowedConnectors, visibleConnectors);
-  // Combine skill system prompt + tool-call prefix.
-  const combinedSystemPrefix = [skillSystemPrompt, toolCallPrefix].filter(Boolean).join("\n\n") || null;
+
+  // RAG retrieval (merged from ragdb). Runs before the stream so the
+  // matched excerpts ride in the system prefix of the FIRST pass —
+  // the quality checker and mode gate then operate on document-
+  // grounded output. buildRagContext never throws; empty results
+  // yield a null prompt and RAG becomes a no-op for this turn.
+  const isRagEnabled = ragEnabled !== false;
+  const ragContext = isRagEnabled
+    ? await buildRagContext(effectiveUserId, text)
+    : null;
+  const ragSystemPrompt = ragContext?.systemPrompt ?? null;
+  const ragSources = ragContext?.sources ?? [];
+  if (ragContext && ragContext.sources.length > 0) {
+    await logAudit({
+      userId: effectiveUserId,
+      source: "rag",
+      event: "rag.retrieval",
+      payload: {
+        query: text.slice(0, 200),
+        matches: ragContext.sources.length,
+        driver: ragContext.driver,
+        degradedToLocal: ragContext.degradedToLocal,
+        topSimilarity: ragContext.sources[0]?.similarity,
+      },
+    });
+  }
+
+  // Combine skill system prompt + RAG context + tool-call prefix.
+  const combinedSystemPrefix =
+    [skillSystemPrompt, ragSystemPrompt, toolCallPrefix].filter(Boolean).join("\n\n") || null;
 
   // Auto-create demo user if needed (only in demo mode)
   if (!userId && enableDemo) {
@@ -289,8 +328,15 @@ export async function POST(req: NextRequest) {
 
       send({ type: "start", chatId: activeChat.id, messageId: assistantMsg.id });
 
+      // Surface RAG source citations immediately — the client renders
+      // the source chips while tokens stream in.
+      if (ragSources.length > 0) {
+        send({ type: "sources", sources: ragSources });
+      }
+
       // Stream first attempt
       let full = "";
+      let fullThinking = "";
       let usage: { promptTokens: number; completionTokens: number; totalTokens: number } | undefined;
       let aborted = false;
 
@@ -311,8 +357,15 @@ export async function POST(req: NextRequest) {
               if (aborted) return;
               send({ type: "token", token });
             },
+            onThinkingToken: (token) => {
+              if (aborted) return;
+              send({ type: "thinking", token });
+            },
             onUsage: (u) => { usage = u; },
-            onDone: (f) => { full = f; },
+            onDone: (f, thinking) => {
+              full = f;
+              if (thinking) fullThinking = thinking;
+            },
             onError: (e) => {
               send({ type: "error", error: e.message });
             },
@@ -510,6 +563,8 @@ export async function POST(req: NextRequest) {
             where: { id: assistantMsg.id },
             data: {
               content: full,
+              thinking: fullThinking || null,
+              sources: ragSources.length > 0 ? JSON.stringify(ragSources) : null,
               promptTokens: usage?.promptTokens,
               completionTokens: usage?.completionTokens,
               totalTokens: usage?.totalTokens,
@@ -527,6 +582,8 @@ export async function POST(req: NextRequest) {
             where: { id: assistantMsg.id },
             data: {
               content: full,
+              thinking: fullThinking || null,
+              sources: ragSources.length > 0 ? JSON.stringify(ragSources) : null,
               promptTokens: usage?.promptTokens,
               completionTokens: usage?.completionTokens,
               totalTokens: usage?.totalTokens,
@@ -557,6 +614,8 @@ export async function POST(req: NextRequest) {
           where: { id: assistantMsg.id },
           data: {
             content: full,
+            thinking: fullThinking || null,
+            sources: ragSources.length > 0 ? JSON.stringify(ragSources) : null,
             promptTokens: usage?.promptTokens,
             completionTokens: usage?.completionTokens,
             totalTokens: usage?.totalTokens,
@@ -653,6 +712,9 @@ export async function POST(req: NextRequest) {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache, no-transform",
       Connection: "keep-alive",
+      // Disable proxy buffering (nginx/Railway edge) so tokens reach
+      // the client as they stream — ported from ragdb.
+      "X-Accel-Buffering": "no",
     },
   });
 }

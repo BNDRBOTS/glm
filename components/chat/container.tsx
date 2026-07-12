@@ -21,6 +21,7 @@ import { LogsPanel } from "@/components/logs/logs-panel";
 import { ThemeSwitcher } from "@/components/themes/theme-switcher";
 import { GroupsPanel } from "@/components/groups/groups-panel";
 import { BillingPanel } from "@/components/billing/billing-panel";
+import { DocumentsPanel } from "@/components/documents/documents-panel";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -42,8 +43,10 @@ export interface SessionInfo {
   user: { id: string; email: string; name: string | null; role: string } | null;
   demoMode: boolean;
   glmConfigured: boolean;
+  deepseekConfigured?: boolean;
   voiceConfigured: boolean;
   billingConfigured: boolean;
+  rag?: { embeddingsProvider: string; driver: string };
 }
 
 export interface ChatContainerProps {
@@ -100,6 +103,7 @@ export function ChatContainer(props: ChatContainerProps) {
   const [themesOpen, setThemesOpen] = React.useState(false);
   const [groupsOpen, setGroupsOpen] = React.useState(false);
   const [billingOpen, setBillingOpen] = React.useState(false);
+  const [documentsOpen, setDocumentsOpen] = React.useState(false);
   const [attachments, setAttachments] = React.useState<File[]>([]);
   const [canvasState, setCanvasState] = React.useState<CanvasState | null>(null);
   const [canvasHistory, setCanvasHistory] = React.useState<CanvasState["history"]>([]);
@@ -116,6 +120,7 @@ export function ChatContainer(props: ChatContainerProps) {
     (window as any).__openThemes = () => setThemesOpen(true);
     (window as any).__openGroups = () => setGroupsOpen(true);
     (window as any).__openBilling = () => setBillingOpen(true);
+    (window as any).__openDocuments = () => setDocumentsOpen(true);
   }, []);
 
   // Auto-scroll on new messages
@@ -144,6 +149,7 @@ export function ChatContainer(props: ChatContainerProps) {
         onNewChat={props.onNewChat}
         onOpenIntegrations={() => setIntegrationsOpen(true)}
         onOpenCanvas={() => setCanvasOpen(true)}
+        onOpenDocuments={() => setDocumentsOpen(true)}
         onOpenExports={() => setExportsOpen(true)}
         onOpenDashboard={props.onOpenDashboard}
         onOpenSkills={() => setSkillsOpen(true)}
@@ -305,6 +311,9 @@ export function ChatContainer(props: ChatContainerProps) {
         onOpenChange={setBillingOpen}
         billingConfigured={props.session?.billingConfigured ?? false}
       />
+
+      {/* Documents (RAG library) */}
+      <DocumentsPanel open={documentsOpen} onOpenChange={setDocumentsOpen} />
 
       {/* Command palette */}
       <CommandPalette

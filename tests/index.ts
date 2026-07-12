@@ -30,20 +30,76 @@ function ok(cond: unknown, msg?: string) {
   assert.ok(cond, msg ?? "");
 }
 
+/**
+ * Minimal valid single-page PDF with one text object, built by hand.
+ * Lets the parser test exercise the REAL unpdf pipeline without a
+ * binary fixture in the repo.
+ */
+function buildMinimalPdf(text: string): Buffer {
+  const objects = [
+    "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+    "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+    "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n",
+  ];
+  const stream = `BT /F1 24 Tf 72 720 Td (${text}) Tj ET`;
+  objects.push(`4 0 obj\n<< /Length ${stream.length} >>\nstream\n${stream}\nendstream\nendobj\n`);
+  objects.push("5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n");
+  let pdf = "%PDF-1.4\n";
+  const offsets = [0];
+  for (const obj of objects) {
+    offsets.push(pdf.length);
+    pdf += obj;
+  }
+  const xrefStart = pdf.length;
+  pdf += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  for (let i = 1; i <= objects.length; i++) {
+    pdf += String(offsets[i]).padStart(10, "0") + " 00000 n \n";
+  }
+  pdf += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefStart}\n%%EOF`;
+  return Buffer.from(pdf, "latin1");
+}
+
 // ---------------------------------------------------------------------
 // Models catalog
 // ---------------------------------------------------------------------
 
 console.log("\nModels catalog");
-await test("has exactly 3 models", async () => {
+await test("has 5 models — 3 GLM (Z.ai) + 2 DeepSeek", async () => {
   const { MODELS } = await import("@/lib/ai/models");
-  eq(MODELS.length, 3, "should have 3 models");
+  eq(MODELS.length, 5, "should have 5 models");
+  eq(MODELS.filter((m) => m.provider === "zai").length, 3, "3 Z.ai models");
+  eq(MODELS.filter((m) => m.provider === "deepseek").length, 2, "2 DeepSeek models");
 });
 
-await test("peak model is GLM 5.2", async () => {
+await test("peak Z.ai model is GLM 5.2", async () => {
   const { MODELS } = await import("@/lib/ai/models");
-  const peak = MODELS.find((m) => m.tier === "peak");
-  ok(peak?.id === "glm-5.2", "peak should be glm-5.2");
+  const peak = MODELS.find((m) => m.tier === "peak" && m.provider === "zai");
+  ok(peak?.id === "glm-5.2", "peak zai should be glm-5.2");
+});
+
+await test("DeepSeek Reasoner present with reasoning + peak tier", async () => {
+  const { getModel } = await import("@/lib/ai/models");
+  const m = getModel("deepseek-reasoner");
+  ok(m, "deepseek-reasoner should exist");
+  eq(m!.provider, "deepseek");
+  ok(m!.reasoning, "reasoner should support reasoning");
+  eq(m!.tier, "peak");
+});
+
+await test("DeepSeek Chat present without reasoning", async () => {
+  const { getModel } = await import("@/lib/ai/models");
+  const m = getModel("deepseek-chat");
+  ok(m, "deepseek-chat should exist");
+  eq(m!.provider, "deepseek");
+  ok(!m!.reasoning, "chat model should not claim reasoning");
+});
+
+await test("provider routing: GLM→zai, DeepSeek→deepseek, unknown→zai", async () => {
+  const { getProviderForModel } = await import("@/lib/ai/models");
+  eq(getProviderForModel("glm-5.2"), "zai");
+  eq(getProviderForModel("glm-5.1-flash"), "zai");
+  eq(getProviderForModel("deepseek-reasoner"), "deepseek");
+  eq(getProviderForModel("some-unknown-model"), "zai", "unknown defaults to zai (pre-merge behavior)");
 });
 
 await test("no 4.6 models present", async () => {
@@ -615,6 +671,459 @@ await test("power plan is free (price 0)", async () => {
   const { PLANS } = await import("@/lib/billing/stripe");
   const power = PLANS.find((p) => p.id === "power");
   eq(power?.priceMonthly, 0);
+});
+
+// ---------------------------------------------------------------------
+// RAG — chunker (merged from ragdb)
+// ---------------------------------------------------------------------
+
+console.log("\nRAG chunker");
+await test("empty / whitespace text produces zero chunks", async () => {
+  const { chunkText } = await import("@/lib/rag/chunker");
+  eq(chunkText("").length, 0);
+  eq(chunkText("   \n\n  ").length, 0);
+});
+
+await test("short text produces a single chunk with its content", async () => {
+  const { chunkText } = await import("@/lib/rag/chunker");
+  const chunks = chunkText("The quick brown fox jumps over the lazy dog.");
+  eq(chunks.length, 1);
+  eq(chunks[0].index, 0);
+  ok(chunks[0].content.includes("quick brown fox"));
+  ok(chunks[0].tokenCount > 0, "token count should be positive");
+});
+
+await test("long text splits into multiple sequentially-indexed chunks", async () => {
+  const { chunkText } = await import("@/lib/rag/chunker");
+  const sentence = "This is a moderately long sentence used to fill the chunk window with tokens. ";
+  const text = sentence.repeat(200);
+  const chunks = chunkText(text, { maxTokens: 128, overlapTokens: 16 });
+  ok(chunks.length > 3, `expected >3 chunks, got ${chunks.length}`);
+  chunks.forEach((c, i) => eq(c.index, i, "chunk indices must be sequential"));
+  for (const c of chunks.slice(0, -1)) {
+    ok(c.tokenCount <= 128 + 32, `chunk ${c.index} exceeds window: ${c.tokenCount}`);
+  }
+});
+
+await test("consecutive chunks overlap (sliding window)", async () => {
+  const { chunkText } = await import("@/lib/rag/chunker");
+  const text = Array.from({ length: 100 }, (_, i) => `Sentence number ${i} carries some words.`).join(" ");
+  const chunks = chunkText(text, { maxTokens: 64, overlapTokens: 16 });
+  ok(chunks.length >= 2, "need at least 2 chunks to check overlap");
+  // The tail of chunk N should reappear at the head of chunk N+1.
+  const tail = chunks[0].content.split(/\s+/).slice(-3).join(" ");
+  ok(chunks[1].content.includes(tail), `overlap missing: "${tail}" not in chunk 1`);
+});
+
+await test("punctuation-light text is preserved verbatim (no welded words)", async () => {
+  const { chunkText } = await import("@/lib/rag/chunker");
+  const text = "alpha beta gamma delta epsilon zeta eta theta";
+  const chunks = chunkText(text);
+  eq(chunks.length, 1);
+  eq(chunks[0].content, text, "capturing split must rebuild source verbatim");
+});
+
+await test("oversized single sentence becomes its own chunk", async () => {
+  const { chunkText } = await import("@/lib/rag/chunker");
+  const giant = Array.from({ length: 900 }, (_, i) => `word${i}`).join(" ") + ".";
+  const chunks = chunkText(`Short lead-in. ${giant} Short tail.`, { maxTokens: 256, overlapTokens: 16 });
+  ok(chunks.some((c) => c.tokenCount > 256), "giant sentence should exceed window as its own chunk");
+});
+
+// ---------------------------------------------------------------------
+// RAG — embeddings (provider chain + local fallback)
+// ---------------------------------------------------------------------
+
+console.log("\nRAG embeddings");
+await test("provider resolution falls back to local without keys", async () => {
+  const { resolveEmbeddingProvider } = await import("@/lib/rag/embeddings");
+  const origOpenai = process.env.OPENAI_API_KEY;
+  const origZai = process.env.ZAI_API_KEY;
+  const origPref = process.env.RAG_EMBEDDINGS_PROVIDER;
+  delete process.env.OPENAI_API_KEY;
+  delete process.env.ZAI_API_KEY;
+  delete process.env.RAG_EMBEDDINGS_PROVIDER;
+  try {
+    eq(resolveEmbeddingProvider(), "local");
+    process.env.OPENAI_API_KEY = "sk-test";
+    eq(resolveEmbeddingProvider(), "openai", "openai wins when key present");
+    process.env.RAG_EMBEDDINGS_PROVIDER = "local";
+    eq(resolveEmbeddingProvider(), "local", "explicit local overrides keys");
+    process.env.RAG_EMBEDDINGS_PROVIDER = "zai";
+    eq(resolveEmbeddingProvider(), "openai", "explicit zai without ZAI key falls back to best available");
+    process.env.ZAI_API_KEY = "zai-test";
+    eq(resolveEmbeddingProvider(), "zai", "explicit zai honored once key exists");
+  } finally {
+    if (origOpenai) process.env.OPENAI_API_KEY = origOpenai; else delete process.env.OPENAI_API_KEY;
+    if (origZai) process.env.ZAI_API_KEY = origZai; else delete process.env.ZAI_API_KEY;
+    if (origPref) process.env.RAG_EMBEDDINGS_PROVIDER = origPref; else delete process.env.RAG_EMBEDDINGS_PROVIDER;
+  }
+});
+
+await test("local embedding is deterministic, 256-dim, L2-normalized", async () => {
+  const { localHashEmbedding, EMBEDDING_DIMENSIONS } = await import("@/lib/rag/embeddings");
+  const a = localHashEmbedding("The mitochondria is the powerhouse of the cell");
+  const b = localHashEmbedding("The mitochondria is the powerhouse of the cell");
+  eq(a.length, EMBEDDING_DIMENSIONS.local);
+  eq(a, b, "same input must produce identical vectors");
+  const norm = Math.sqrt(a.reduce((acc, v) => acc + v * v, 0));
+  ok(Math.abs(norm - 1) < 1e-9, `expected unit norm, got ${norm}`);
+});
+
+await test("local embedding: zero vector for empty text, no NaNs", async () => {
+  const { localHashEmbedding } = await import("@/lib/rag/embeddings");
+  const v = localHashEmbedding("");
+  ok(v.every((x) => x === 0), "empty text → zero vector");
+  const w = localHashEmbedding("hello");
+  ok(w.every((x) => Number.isFinite(x)), "no NaN/Infinity components");
+});
+
+await test("embedBatch(local) preserves order and length", async () => {
+  const { embedBatch, localHashEmbedding } = await import("@/lib/rag/embeddings");
+  const texts = ["first text", "second text", "third text"];
+  const batch = await embedBatch(texts, "local");
+  eq(batch.length, 3);
+  eq(batch[1], localHashEmbedding("second text"), "batch order must match input order");
+  eq((await embedBatch([], "local")).length, 0, "empty batch → empty result");
+});
+
+await test("openai/zai providers throw clearly without keys (no silent fake vectors)", async () => {
+  const { embedText } = await import("@/lib/rag/embeddings");
+  const origOpenai = process.env.OPENAI_API_KEY;
+  const origZai = process.env.ZAI_API_KEY;
+  delete process.env.OPENAI_API_KEY;
+  delete process.env.ZAI_API_KEY;
+  try {
+    for (const provider of ["openai", "zai"] as const) {
+      let threw = false;
+      try {
+        await embedText("x", provider);
+      } catch (e) {
+        threw = true;
+        ok(String(e).includes("API_KEY"), `error should name the missing key: ${e}`);
+      }
+      ok(threw, `${provider} should throw without a key`);
+    }
+  } finally {
+    if (origOpenai) process.env.OPENAI_API_KEY = origOpenai;
+    if (origZai) process.env.ZAI_API_KEY = origZai;
+  }
+});
+
+// ---------------------------------------------------------------------
+// RAG — similarity + ranking (pure core of the local driver)
+// ---------------------------------------------------------------------
+
+console.log("\nRAG similarity + ranking");
+await test("cosine: identical=1, orthogonal=0, dimension mismatch=0", async () => {
+  const { cosineSimilarity } = await import("@/lib/rag/similarity");
+  ok(Math.abs(cosineSimilarity([1, 2, 3], [1, 2, 3]) - 1) < 1e-9);
+  eq(cosineSimilarity([1, 0], [0, 1]), 0);
+  eq(cosineSimilarity([1, 2], [1, 2, 3]), 0, "mismatched dims must score 0, not throw");
+  eq(cosineSimilarity([], []), 0);
+  eq(cosineSimilarity([0, 0], [1, 1]), 0, "zero vector must score 0, not NaN");
+});
+
+await test("rankChunks: threshold filters, topK caps, sorted desc", async () => {
+  const { rankChunks } = await import("@/lib/rag/similarity");
+  const mk = (id: string, embedding: number[]) => ({
+    id, documentId: "d1", documentTitle: "Doc", chunkIndex: 0, content: id, embedding,
+  });
+  const query = [1, 0, 0];
+  const ranked = rankChunks(query, [
+    mk("exact", [1, 0, 0]),
+    mk("close", [0.9, 0.1, 0]),
+    mk("far", [0, 1, 0]),
+    mk("mid", [0.5, 0.5, 0]),
+  ], { topK: 2, matchThreshold: 0.3 });
+  eq(ranked.length, 2, "topK=2 caps results");
+  eq(ranked[0].id, "exact");
+  eq(ranked[1].id, "close");
+  ok(ranked.every((r) => r.similarity >= 0.3), "threshold enforced");
+});
+
+await test("rankChunks: empty input and no matches return []", async () => {
+  const { rankChunks } = await import("@/lib/rag/similarity");
+  eq(rankChunks([1, 0], [], {}).length, 0);
+  const none = rankChunks([1, 0], [
+    { id: "a", documentId: "d", documentTitle: "D", chunkIndex: 0, content: "a", embedding: [0, 1] },
+  ], { matchThreshold: 0.5 });
+  eq(none.length, 0);
+});
+
+await test("local embeddings + ranking retrieve the semantically-overlapping chunk", async () => {
+  const { localHashEmbedding } = await import("@/lib/rag/embeddings");
+  const { rankChunks } = await import("@/lib/rag/similarity");
+  const docs = [
+    "The refund policy allows returns within 30 days of purchase with a receipt.",
+    "Our office hours are Monday through Friday, nine to five, Eastern time.",
+    "Deploy the application to Railway using the provided railway.json config.",
+  ];
+  const chunks = docs.map((content, i) => ({
+    id: `c${i}`, documentId: `d${i}`, documentTitle: `Doc ${i}`, chunkIndex: 0,
+    content, embedding: localHashEmbedding(content),
+  }));
+  const query = localHashEmbedding("what is the refund policy for returns?");
+  const ranked = rankChunks(query, chunks, { topK: 1, matchThreshold: 0.05 });
+  eq(ranked.length, 1);
+  eq(ranked[0].id, "c0", "refund chunk should rank first");
+});
+
+// ---------------------------------------------------------------------
+// RAG — pipeline (prompt assembly, ragdb semantics)
+// ---------------------------------------------------------------------
+
+console.log("\nRAG pipeline");
+await test("formatContext numbers sources and separates with ---", async () => {
+  const { formatContext } = await import("@/lib/rag/pipeline");
+  const ctx = formatContext([
+    { id: "a", documentId: "d1", documentTitle: "Contract", chunkIndex: 2, content: "Clause A", similarity: 0.9 },
+    { id: "b", documentId: "d2", documentTitle: "Manual", chunkIndex: 0, content: "Step one", similarity: 0.8 },
+  ]);
+  ok(ctx.includes("[Source 1 | Contract | chunk:2]"), "first source header");
+  ok(ctx.includes("[Source 2 | Manual | chunk:0]"), "second source header");
+  ok(ctx.includes("\n\n---\n\n"), "separator between sources");
+  eq(formatContext([]), "");
+});
+
+await test("buildRagSystemPrompt: cite instruction with chunks, null without", async () => {
+  const { buildRagSystemPrompt } = await import("@/lib/rag/pipeline");
+  const prompt = buildRagSystemPrompt([
+    { id: "a", documentId: "d1", documentTitle: "Doc", chunkIndex: 0, content: "Fact.", similarity: 0.9 },
+  ]);
+  ok(prompt, "prompt should exist with chunks");
+  ok(prompt!.includes("Cite [Source N]"), "must instruct citation");
+  ok(prompt!.includes("say so plainly"), "must instruct honesty when absent");
+  eq(buildRagSystemPrompt([]), null, "no chunks → null (chat prefix stack untouched)");
+});
+
+await test("toSources truncates snippets to 200 chars and rounds similarity", async () => {
+  const { toSources } = await import("@/lib/rag/pipeline");
+  const long = "x".repeat(500);
+  const sources = toSources([
+    { id: "a", documentId: "d", documentTitle: "T", chunkIndex: 1, content: long, similarity: 0.87654 },
+  ]);
+  eq(sources[0].snippet.length, 200);
+  eq(sources[0].similarity, 0.877);
+  eq(sources[0].chunkId, "a");
+});
+
+// ---------------------------------------------------------------------
+// RAG — parsers (real parsing, no mocks: txt, md, xlsx, pdf)
+// ---------------------------------------------------------------------
+
+console.log("\nRAG parsers");
+await test("txt + markdown parse via direct utf-8", async () => {
+  const { parseDocument } = await import("@/lib/rag/parsers");
+  eq(await parseDocument(Buffer.from("hello world"), "text/plain"), "hello world");
+  eq(await parseDocument(Buffer.from("# Title\n\nBody"), "text/markdown"), "# Title\n\nBody");
+});
+
+await test("unsupported MIME type throws", async () => {
+  const { parseDocument } = await import("@/lib/rag/parsers");
+  let threw = false;
+  try {
+    await parseDocument(Buffer.from("x"), "image/png");
+  } catch (e) {
+    threw = true;
+    ok(String(e).includes("Unsupported MIME type"));
+  }
+  ok(threw);
+});
+
+await test("xlsx round-trip: written workbook parses back to sheet CSV", async () => {
+  const XLSX = await import("xlsx");
+  const { parseDocument, XLSX_MIME } = await import("@/lib/rag/parsers");
+  const ws = XLSX.utils.aoa_to_sheet([
+    ["Product", "Price"],
+    ["Widget", 9.99],
+    ["Gadget", 24.5],
+  ]);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, "Inventory");
+  const buf = XLSX.write(wb, { type: "buffer", bookType: "xlsx" }) as Buffer;
+  const text = await parseDocument(buf, XLSX_MIME);
+  ok(text.includes("=== Sheet: Inventory ==="), "sheet header present");
+  ok(text.includes("Widget,9.99"), "row data present as CSV");
+});
+
+await test("pdf: handcrafted single-page PDF extracts its text via unpdf", async () => {
+  const { parseDocument } = await import("@/lib/rag/parsers");
+  const buf = buildMinimalPdf("RAG merge verification text");
+  const text = await parseDocument(buf, "application/pdf");
+  ok(text.includes("RAG merge verification text"), `extracted: ${text.slice(0, 80)}`);
+});
+
+await test("corrupt pdf fails loudly (error path, not silent empty)", async () => {
+  const { parseDocument } = await import("@/lib/rag/parsers");
+  let threw = false;
+  try {
+    await parseDocument(Buffer.from("%PDF-1.4 garbage no xref"), "application/pdf");
+  } catch {
+    threw = true;
+  }
+  ok(threw, "corrupt PDF should raise, ingest marks document status=error");
+});
+
+await test("resolveMimeType: trusts allowed types, falls back to extension", async () => {
+  const { resolveMimeType, ALLOWED_MIME, DOCX_MIME, XLSX_MIME } = await import("@/lib/rag/parsers");
+  eq(resolveMimeType("a.pdf", "application/pdf"), "application/pdf");
+  eq(resolveMimeType("notes.md", ""), "text/markdown", "browsers omit .md MIME — extension fallback");
+  eq(resolveMimeType("report.docx", "application/octet-stream"), DOCX_MIME);
+  eq(resolveMimeType("sheet.xlsx", null), XLSX_MIME);
+  eq(resolveMimeType("evil.exe", "application/x-msdownload"), null);
+  eq(ALLOWED_MIME.size, 5, "exactly 5 supported MIME types (pdf, docx, xlsx, txt, md)");
+});
+
+// ---------------------------------------------------------------------
+// AI client — provider message normalization (DeepSeek alternation)
+// ---------------------------------------------------------------------
+
+console.log("\nAI provider messages");
+await test("zai: leading system turns merge, rest pass through untouched", async () => {
+  const { buildProviderMessages } = await import("@/lib/ai/client");
+  const out = buildProviderMessages("zai", [
+    { role: "system", content: "A" },
+    { role: "system", content: "B" },
+    { role: "user", content: "hi" },
+    { role: "assistant", content: "hello" },
+    { role: "system", content: "tool results" },
+  ]);
+  eq(out[0].role, "system");
+  eq(out[0].content, "A\n\nB");
+  eq(out.length, 4, "non-leading system preserved for zai");
+  eq(out[3].role, "system");
+});
+
+await test("deepseek: consecutive same-role turns merge (ragdb behavior)", async () => {
+  const { buildProviderMessages } = await import("@/lib/ai/client");
+  const out = buildProviderMessages("deepseek", [
+    { role: "system", content: "sys" },
+    { role: "user", content: "first" },
+    { role: "user", content: "second" },
+    { role: "assistant", content: "reply" },
+    { role: "user", content: "third" },
+  ]);
+  eq(out.length, 4);
+  eq(out[1].content, "first\n\nsecond", "consecutive user turns merged");
+  eq(out[1].role, "user");
+  eq(out[2].role, "assistant");
+  eq(out[3].role, "user");
+});
+
+await test("deepseek: strict alternation after system (no adjacent same-role)", async () => {
+  const { buildProviderMessages } = await import("@/lib/ai/client");
+  const out = buildProviderMessages("deepseek", [
+    { role: "system", content: "sys" },
+    { role: "user", content: "q" },
+    { role: "assistant", content: "a" },
+    { role: "system", content: "tool results here" },
+    { role: "user", content: "follow-up" },
+  ]);
+  const rest = out.slice(1);
+  for (let i = 1; i < rest.length; i++) {
+    ok(rest[i].role !== rest[i - 1].role, `adjacent same-role at ${i}: ${rest[i].role}`);
+  }
+  ok(rest[0].role === "user", "first non-system must be user");
+  ok(out.some((m) => m.content.includes("tool results here")), "folded system content preserved");
+});
+
+await test("deepseek: leading assistant turn dropped, tool turns folded to user", async () => {
+  const { buildProviderMessages } = await import("@/lib/ai/client");
+  const out = buildProviderMessages("deepseek", [
+    { role: "assistant", content: "orphaned reply" },
+    { role: "user", content: "real question" },
+    { role: "tool", content: "tool output" },
+  ]);
+  ok(out[0].role === "user", "leading assistant dropped");
+  ok(out.some((m) => m.role === "user" && m.content.includes("tool output")), "tool folded into user");
+});
+
+await test("isProviderConfigured reflects env keys per provider", async () => {
+  const { isProviderConfigured } = await import("@/lib/ai/client");
+  const origZai = process.env.ZAI_API_KEY;
+  const origDs = process.env.DEEPSEEK_API_KEY;
+  delete process.env.ZAI_API_KEY;
+  delete process.env.DEEPSEEK_API_KEY;
+  try {
+    ok(!isProviderConfigured("zai"));
+    ok(!isProviderConfigured("deepseek"));
+    process.env.DEEPSEEK_API_KEY = "ds-test";
+    ok(isProviderConfigured("deepseek"));
+    ok(!isProviderConfigured("zai"), "keys are independent per provider");
+  } finally {
+    if (origZai) process.env.ZAI_API_KEY = origZai;
+    if (origDs) process.env.DEEPSEEK_API_KEY = origDs; else delete process.env.DEEPSEEK_API_KEY;
+  }
+});
+
+// ---------------------------------------------------------------------
+// RAG — retrieval security boundary + driver config
+// ---------------------------------------------------------------------
+
+console.log("\nRAG security + drivers");
+await test("retrieveChunks refuses to run without a userId (no unscoped path)", async () => {
+  const { retrieveChunks } = await import("@/lib/rag/retriever");
+  let threw = false;
+  try {
+    await retrieveChunks("", "query");
+  } catch (e) {
+    threw = true;
+    ok(String(e).includes("userId"));
+  }
+  ok(threw, "empty userId must throw before touching data");
+});
+
+await test("ingestDocument refuses empty userId and empty/oversized files", async () => {
+  const { ingestDocument, MAX_FILE_SIZE } = await import("@/lib/rag/ingest");
+  eq(MAX_FILE_SIZE, 50 * 1024 * 1024, "50 MB cap preserved from ragdb");
+  for (const [userId, buffer, expect] of [
+    ["", Buffer.from("x"), "userId"],
+    ["u1", Buffer.alloc(0), "Empty file"],
+  ] as const) {
+    let threw = false;
+    try {
+      await ingestDocument(userId, { filename: "a.txt", mimeType: "text/plain", buffer });
+    } catch (e) {
+      threw = true;
+      ok(String(e).includes(expect), `expected "${expect}" in: ${e}`);
+    }
+    ok(threw, `should throw for ${expect}`);
+  }
+});
+
+await test("rag driver defaults to local; supabase requires full config", async () => {
+  const { resolveRagDriver, getSupabaseRagConfig } = await import("@/lib/rag/retriever");
+  const orig = {
+    driver: process.env.RAG_DRIVER,
+    url: process.env.SUPABASE_URL,
+    ragUrl: process.env.RAG_SUPABASE_URL,
+    key: process.env.SUPABASE_SERVICE_ROLE_KEY,
+    ragKey: process.env.RAG_SUPABASE_SERVICE_KEY,
+  };
+  delete process.env.RAG_DRIVER;
+  delete process.env.SUPABASE_URL;
+  delete process.env.RAG_SUPABASE_URL;
+  delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+  delete process.env.RAG_SUPABASE_SERVICE_KEY;
+  try {
+    eq(resolveRagDriver(), "local", "default driver is local");
+    eq(getSupabaseRagConfig(), null, "no config without env");
+    process.env.RAG_DRIVER = "supabase";
+    eq(resolveRagDriver(), "local", "supabase without URL+key degrades to local");
+    process.env.SUPABASE_URL = "https://x.supabase.co";
+    process.env.SUPABASE_SERVICE_ROLE_KEY = "service-key";
+    eq(resolveRagDriver(), "supabase", "fully configured supabase driver activates");
+    const cfg = getSupabaseRagConfig();
+    eq(cfg?.url, "https://x.supabase.co");
+  } finally {
+    for (const [k, v] of Object.entries({
+      RAG_DRIVER: orig.driver, SUPABASE_URL: orig.url, RAG_SUPABASE_URL: orig.ragUrl,
+      SUPABASE_SERVICE_ROLE_KEY: orig.key, RAG_SUPABASE_SERVICE_KEY: orig.ragKey,
+    })) {
+      if (v) process.env[k] = v; else delete process.env[k];
+    }
+  }
 });
 
 // ---------------------------------------------------------------------

@@ -6,6 +6,15 @@ import ReactMarkdown from "react-markdown";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
 
+export interface MessageSource {
+  chunkId: string;
+  documentId: string;
+  documentTitle: string;
+  chunkIndex: number;
+  snippet: string;
+  similarity: number;
+}
+
 export interface ChatMessageProps {
   id: string;
   role: "user" | "assistant" | "system";
@@ -16,6 +25,12 @@ export interface ChatMessageProps {
   createdAt: string;
   // Optional attachments (rendered above content)
   attachments?: { filename: string; mimeType: string; size: number }[];
+  // Reasoning trace (deepseek-reasoner / GLM thinking) — collapsible,
+  // never mixed into content. Merged from ragdb's ThinkingPanel.
+  thinking?: string;
+  thinkingStreaming?: boolean;
+  // RAG source citations for this turn (numbered [Source N] chips)
+  sources?: MessageSource[];
 }
 
 export function ChatMessage({ message }: { message: ChatMessageProps }) {
@@ -82,6 +97,13 @@ export function ChatMessage({ message }: { message: ChatMessageProps }) {
             </div>
           )}
 
+          {isAssistant && message.thinking && (
+            <ThinkingPanel
+              content={message.thinking}
+              streaming={message.thinkingStreaming}
+            />
+          )}
+
           <div
             className={cn(
               "inline-block max-w-full rounded-2xl px-4 py-3 text-[15px] leading-relaxed",
@@ -95,6 +117,10 @@ export function ChatMessage({ message }: { message: ChatMessageProps }) {
               streaming={message.streaming}
             />
           </div>
+
+          {isAssistant && message.sources && message.sources.length > 0 && (
+            <SourcesRow sources={message.sources} />
+          )}
 
           {message.tokens != null && !message.streaming && (
             <div className="text-[10px] text-muted-foreground">
@@ -210,7 +236,76 @@ function MarkdownRenderer({
   );
 }
 
+/**
+ * Collapsible reasoning trace. Ported from ragdb's ThinkingPanel and
+ * restyled to the platform's glass design system (no amber block).
+ */
+function ThinkingPanel({ content, streaming }: { content: string; streaming?: boolean }) {
+  const [expanded, setExpanded] = React.useState(false);
+
+  if (!content) return null;
+
+  return (
+    <div className="glass max-w-full rounded-xl">
+      <button
+        type="button"
+        onClick={() => setExpanded((v) => !v)}
+        className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left text-xs font-medium text-muted-foreground hover:text-foreground press-smooth"
+        aria-expanded={expanded}
+      >
+        <span className={cn("transition-transform", expanded && "rotate-90")}>
+          <ChevronGlyph />
+        </span>
+        <span>{streaming ? "Thinking…" : "View reasoning"}</span>
+        {streaming && (
+          <span className="ml-auto h-2 w-2 animate-pulse rounded-full bg-foreground/60" />
+        )}
+      </button>
+      {expanded && (
+        <div className="max-h-64 overflow-y-auto whitespace-pre-wrap px-4 pb-3 pt-1 font-mono text-xs leading-relaxed text-muted-foreground">
+          {content}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Numbered RAG source chips — [Source N] citations in the answer map
+ * to these. Hovering shows the snippet.
+ */
+function SourcesRow({ sources }: { sources: MessageSource[] }) {
+  return (
+    <div className="flex max-w-full flex-wrap items-center gap-1.5">
+      <span className="text-[10px] uppercase tracking-[0.18em] text-muted-foreground">
+        Sources
+      </span>
+      {sources.map((s, i) => (
+        <span
+          key={s.chunkId || i}
+          className="glass inline-flex max-w-56 items-center gap-1.5 rounded-lg px-2 py-1 text-[11px]"
+          title={`${s.documentTitle} · chunk ${s.chunkIndex} · ${(s.similarity * 100).toFixed(0)}% match\n\n${s.snippet}`}
+        >
+          <span className="font-semibold text-muted-foreground">{i + 1}</span>
+          <span className="truncate">{s.documentTitle}</span>
+          <span className="shrink-0 text-muted-foreground">
+            {(s.similarity * 100).toFixed(0)}%
+          </span>
+        </span>
+      ))}
+    </div>
+  );
+}
+
 // ----- SVG glyphs (no emojis) ----------------------------------------
+
+function ChevronGlyph() {
+  return (
+    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="m9 18 6-6-6-6" />
+    </svg>
+  );
+}
 
 function UserGlyph() {
   return (

@@ -1,10 +1,10 @@
-# GLM Power Platform
+# GLM Power Platform × RAG
 
-A power-user chat platform for GLM 5.2 — full token limits, maximum reasoning, no kick-down. Built for someone who works with AI 48 hours at a time and needs the real thing.
+A power-user chat platform for GLM 5.2 — full token limits, maximum reasoning, no kick-down — **merged with the RAG Chat document-intelligence platform (ragdb)**. Upload PDFs, Word docs, spreadsheets, or plain text; the platform chunks, embeds, and indexes them, and every RAG-enabled turn performs a live similarity search and answers with numbered, cited sources. Built for someone who works with AI 48 hours at a time and needs the real thing.
 
 ## What this is
 
-A cloud-deployed chat platform with: GLM 5.2 streaming, two isolated accounts, code canvas, turn-by-turn JSON logging, 6 connectors, 5 backends (all REAL implementations), 3-mode permissions, silent AI slop checker, real-time intent distillation, voice input (Z.ai ASR + Whisper fallback), skill system (maker/accepter/reader), unified audit log, 5 premade themes (WCAG-tested), command palette, token dashboard, and REAL Stripe billing (feature-flagged).
+A cloud-deployed chat platform with: GLM 5.2 + DeepSeek streaming (visible reasoning traces), **RAG document intelligence** (PDF/DOCX/XLSX/TXT/MD ingest → chunk → embed → cited retrieval), two isolated accounts, code canvas, turn-by-turn JSON logging, 6 connectors, 5 backends (all REAL implementations), 3-mode permissions, silent AI slop checker, real-time intent distillation, voice input (Z.ai ASR + Whisper fallback), skill system (maker/accepter/reader), unified audit log, 5 premade themes (WCAG-tested), command palette, token dashboard, and REAL Stripe billing (feature-flagged).
 
 ## Stack (the correct way, not the basic way)
 
@@ -20,15 +20,29 @@ A cloud-deployed chat platform with: GLM 5.2 streaming, two isolated accounts, c
 - **PWA** manifest — installs like a native app
 - **Bun** as runtime + test runner
 - **Real SDKs**: pg, mongodb, @libsql/client, firebase-admin, stripe, @stripe/stripe-js, openai (all lazy-loaded)
+- **RAG parsers**: unpdf (serverless pdfjs), mammoth (docx), xlsx — all lazy-loaded
+- **DeepSeek**: OpenAI-compatible streaming with `reasoning_content` thinking traces
 
 ## What works right now (browser-verified)
 
 ### Chat core
 - Chat with GLM 5.2 streaming (mock stream until you add an API key)
-- Quick-model switcher — GLM 5.1, GLM 5.1 Flash (no 4.x models)
+- Quick-model switcher — GLM 5.1, GLM 5.1 Flash (no 4.x models) **+ DeepSeek Reasoner / DeepSeek Chat** (provider-grouped picker; each model routes to its own API)
+- **Reasoning traces** — `reasoning_content` tokens (DeepSeek Reasoner and thinking-enabled GLM) stream as separate `thinking` events into a collapsible panel, persisted per message, never mixed into content
 - File upload UI
 - Turn-by-turn JSON logging — every turn persisted to DB
 - **Voice input** — real STT via Z.ai ASR (same key as GLM) + OpenAI Whisper fallback. Mic button in composer with live recording state.
+
+### RAG document intelligence (merged from ragdb)
+- Upload PDF / DOCX / XLSX / TXT / MD (max 50 MB) via the Documents panel — drag & drop or browse
+- Ingest pipeline: parse (unpdf / mammoth / xlsx / direct) → sentence-boundary chunking (512 tokens, 64 overlap) → batched embeddings (256/call) → per-user index
+- **Embedding provider chain**: OpenAI `text-embedding-3-small` (primary, 1536-dim) → Z.ai `embedding-3` (same key as GLM, 1536-dim) → deterministic local hash embeddings (256-dim, zero keys — dev/preview grade, honestly labeled)
+- **Dual retrieval drivers**: `local` (default — exact cosine over Prisma-stored vectors, SQLite + Postgres, zero infra) and `supabase` (optional pgvector HNSW accelerator, `m=16/ef_construction=64/ef_search=100`, auto-fallback to local on any failure)
+- Every RAG turn injects matched chunks as numbered `[Source N]` excerpts with a citation instruction; the answer cites them and the UI renders source chips (title + similarity % + snippet on hover)
+- **Docs toggle** in the composer — RAG on by default, no-ops instantly at zero documents
+- Document lifecycle: `processing → ready | error` with the failure reason surfaced in the library; deletes cascade chunks + stored file + pgvector mirror
+- Multi-tenant isolation: every query scoped by the authenticated user id; no unscoped retrieval path exists; ragdb's original RLS/auth.uid() schema preserved under `supabase/migrations/`
+- RAG works with the quality checker, mode gates, skills, and tool calls — retrieval context rides in the same system-prefix stack
 
 ### Connectors (6 adapters, REAL implementations)
 - **CourtListener** — free case law search (Free Law Project)
@@ -156,6 +170,28 @@ A cloud-deployed chat platform with: GLM 5.2 streaming, two isolated accounts, c
 8. **UsageLog missing Chat relation**: dashboard query crashed. Schema fixed.
 9. **firebase-admin transitively needs @opentelemetry/api**: installed.
 
+## Merge provenance — where every ragdb capability lives now
+
+Nothing from either platform was dropped. Feature-by-feature mapping from the ragdb repository into this codebase:
+
+| ragdb capability | Merged location | Notes |
+|---|---|---|
+| Sentence-boundary chunker (512/64) | `lib/rag/chunker.ts` | Ported intact, incl. verbatim-rebuild fallback for punctuation-light text |
+| Parsers: unpdf / mammoth / xlsx / txt+md | `lib/rag/parsers/` | All lazy-loaded; extension fallback added for browsers that omit `.md` MIME |
+| OpenAI `text-embedding-3-small` (batched) | `lib/rag/embeddings.ts` | Still primary; Z.ai + local fallbacks added so RAG never hard-fails |
+| `match_chunks` pgvector/HNSW retrieval | `supabase/rag/101_rag_pgvector.sql` + `lib/rag/retriever.ts` | Same index geometry; adapted to NextAuth trust model; auto-fallback to local |
+| Original RLS / `auth.uid()` schema + storage bucket | `supabase/migrations/` | Preserved byte-for-byte for the standalone Supabase-Auth flavor |
+| `[Source N]` prompt assembly + citation instruction | `lib/rag/pipeline.ts` | Same wording; numbered excerpts, honest no-answer instruction |
+| Upload → parse → chunk → embed → status lifecycle | `lib/rag/ingest.ts` + `/api/documents` | Same statuses (`processing/ready/error`), 50 MB cap, 256-batch embedding |
+| DeepSeek streaming client (`deepseek-reasoner`) | `lib/ai/client.ts` + `lib/ai/models.ts` | Now a first-class provider next to GLM; + `deepseek-chat` |
+| Strict-alternation message builder | `buildProviderMessages()` in `lib/ai/client.ts` | Same merge semantics; also folds tool/system turns |
+| Thinking-trace streaming + panel | `thinking` SSE events + `ThinkingPanel` in `components/chat/message.tsx` | Restyled to glass design; also surfaces GLM's own reasoning |
+| Source chips on answers | `SourcesRow` in `components/chat/message.tsx` | Title + similarity % + snippet on hover, persisted per message |
+| Documents library UI (upload zone + list) | `components/documents/documents-panel.tsx` | Drag & drop, status dots, chunk counts, delete |
+| `X-Accel-Buffering: no`, `maxDuration = 300` | `/api/chat`, `/api/documents` | SSE + long-ingest hardening ported |
+| Multi-tenant isolation | userId-scoped Prisma queries + server-only pgvector RPC | No unscoped retrieval path exists (tested) |
+| Tuning constants co-located with code | `lib/rag/*` (see RAG tuning table) | ragdb convention kept |
+
 ## Slots ready for later (not built — by design)
 
 - **Pinecone memory mesh** — `extractDeep()` in `src/lib/memory/index.ts` is the single swap point.
@@ -181,6 +217,8 @@ src/
       connectors/           — connector save/list/test
       dashboard/            — token usage stats
       distillation/         — live distillation state
+      documents/            — RAG library: list + upload (multipart)
+        [id]/               — RAG document detail + delete
       exports/              — raw + aggregated export
       health/               — Railway healthcheck
       integrations/         — legacy (routes to connectors)
@@ -195,6 +233,7 @@ src/
     chat/                   — message, composer (with mic), sidebar, container, mode-picker, command-palette, intent-drift-badge, theme-toggle
     chat/dashboard/         — token usage dashboard
     canvas/                 — code canvas panel
+    documents/              — RAG library panel (upload zone + list)
     integrations/           — connectors panel
     logs/                   — audit log panel
     skills/                 — skills panel (maker/accepter/reader)
@@ -215,6 +254,8 @@ src/
     memory/                 — turn-by-turn JSON logging + deep aggregator
     permissions/            — auto/plan/accept-edits modes + slop detector
     quality/                — silent AI checker with retry orchestrator
+    rag/                    — merged RAG engine (chunker, parsers, embeddings,
+                              similarity, retriever, pipeline, ingest)
     server-guard.ts         — testing-friendly server-only replacement
     skills/                 — skill maker/accepter/reader + trigger matching
     themes/                 — 5 premade themes + apply/load
@@ -226,7 +267,11 @@ src/
     index.ts                — 56 smoke + sanity + WCAG tests
     preload.ts              — Bun plugin for test environment
 prisma/
-  schema.prisma             — User, Chat, Message, Group, Integration, MemoryLog, UsageLog, CanvasState, Skill, AuditLog
+  schema.prisma             — User, Chat, Message, Group, Integration, MemoryLog, UsageLog, CanvasState, Skill, AuditLog, Document, DocumentChunk
+supabase/
+  rag/101_rag_pgvector.sql  — optional pgvector HNSW accelerator (merged platform)
+  migrations/               — ragdb's original Supabase-Auth schema, preserved verbatim
+  README.md                 — both RAG deployment flavors explained
 public/
   icon.svg, manifest.webmanifest
 .env.example                — every env var you need
@@ -236,13 +281,29 @@ bunfig.toml                 — Bun test config
 SETUP-GUIDE.md              — dummy-proof step-by-step
 ```
 
+## RAG tuning
+
+All tunable constants are co-located with the code that uses them (ragdb convention):
+
+| Constant | Location | Default | Effect |
+|---|---|---|---|
+| `MAX_FILE_SIZE` | `lib/rag/ingest.ts` | 50 MB | Hard cap on upload size |
+| `maxTokens` | `lib/rag/ingest.ts` → `chunkText()` | 512 | Max tokens per chunk |
+| `overlapTokens` | `lib/rag/ingest.ts` → `chunkText()` | 64 | Context overlap between chunks |
+| `DEFAULT_TOP_K` | `lib/rag/similarity.ts` | 8 | Chunks retrieved per query |
+| `DEFAULT_MATCH_THRESHOLD` | `lib/rag/similarity.ts` | 0.3 | Min cosine similarity (0–1) |
+| `EMBED_BATCH_SIZE` | `lib/rag/ingest.ts` | 256 | Chunks per embedding API call |
+| `hnsw.ef_search` | `supabase/rag/101_rag_pgvector.sql` | 100 | HNSW recall depth (pgvector mode) |
+
+Env switches: `RAG_EMBEDDINGS_PROVIDER` (auto/openai/zai/local), `RAG_DRIVER` (local/supabase), `DEEPSEEK_API_KEY`. See `.env.example`.
+
 ## Running tests
 
 ```bash
-bun run tests/index.ts
+bun run test
 ```
 
-Runs 56 smoke + sanity + WCAG tests covering:
+Runs 91 smoke + sanity + WCAG + RAG tests covering:
 - Models catalog (no 4.6, has 5.1 + flash)
 - Connectors registry (6 connectors, CourtListener + Midpage manifests)
 - Backends registry (5 backends, Supabase required fields)
@@ -256,6 +317,13 @@ Runs 56 smoke + sanity + WCAG tests covering:
 - Skills (trigger matching, disabled skills skipped)
 - Audit log (writes without throwing, swallows errors)
 - Stripe (not configured returns structured response, 3 plans, power is free)
+- RAG chunker (empty/short/long/overlap/verbatim/oversized-sentence cases)
+- RAG embeddings (provider chain fallback, deterministic local vectors, batch ordering, loud key errors)
+- RAG similarity + ranking (cosine edge cases, threshold/topK, end-to-end lexical retrieval)
+- RAG pipeline (numbered sources, citation prompt, snippet truncation)
+- RAG parsers (txt/md/xlsx round-trip, REAL handcrafted-PDF extraction via unpdf, corrupt-PDF failure path, MIME/extension resolution)
+- AI providers (5-model catalog, provider routing, DeepSeek strict-alternation message builder, per-provider key detection)
+- RAG security (no unscoped retrieval, ingest input validation, driver config gating)
 
 ## Quick start
 

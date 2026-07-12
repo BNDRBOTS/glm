@@ -64,6 +64,8 @@ export async function GET(
       content: true,
       model: true,
       totalTokens: true,
+      thinking: true,
+      sources: true,
       createdAt: true,
       authorId: true,
     },
@@ -93,15 +95,23 @@ export async function GET(
       updatedAt: chat.updatedAt.toISOString(),
       pinned: chat.pinned,
     },
-    messages: messages.map((m) => ({
-      id: m.id,
-      role: m.role,
-      content: m.content,
-      model: m.model,
-      tokens: m.totalTokens,
-      createdAt: m.createdAt.toISOString(),
-      authorId: m.authorId,
-    })),
+    messages: messages.map((m) => {
+      let sources: unknown = null;
+      if (m.sources) {
+        try { sources = JSON.parse(m.sources); } catch { /* malformed — omit */ }
+      }
+      return {
+        id: m.id,
+        role: m.role,
+        content: m.content,
+        model: m.model,
+        tokens: m.totalTokens,
+        thinking: m.thinking,
+        sources,
+        createdAt: m.createdAt.toISOString(),
+        authorId: m.authorId,
+      };
+    }),
   });
 }
 

@@ -44,6 +44,7 @@ export interface SidebarProps {
   onNewChat: () => void;
   onOpenIntegrations: () => void;
   onOpenCanvas: () => void;
+  onOpenDocuments: () => void;
   onOpenExports: () => void;
   onOpenDashboard: () => void;
   onOpenSkills: () => void;
@@ -64,6 +65,7 @@ export function Sidebar({
   onNewChat,
   onOpenIntegrations,
   onOpenCanvas,
+  onOpenDocuments,
   onOpenExports,
   onOpenDashboard,
   onOpenSkills,
@@ -214,6 +216,7 @@ export function Sidebar({
       {/* Tools */}
       <div className="border-t border-border p-2">
         <div className="space-y-0.5">
+          <SidebarToolButton onClick={onOpenDocuments} icon={<DocumentsIcon />} label="Documents" />
           <SidebarToolButton onClick={onOpenCanvas} icon={<CanvasIcon />} label="Code canvas" />
           <SidebarToolButton onClick={onOpenIntegrations} icon={<PlugIcon />} label="Connectors" />
           <SidebarToolButton onClick={onOpenSkills} icon={<SkillIcon />} label="Skills" />
@@ -309,6 +312,17 @@ function BrandMark() {
       <rect width="64" height="64" rx="14" fill="currentColor" />
       <path d="M16 22 L32 14 L48 22 L48 42 L32 50 L16 42 Z" stroke="#fff" strokeWidth="2.5" strokeLinejoin="round" fill="none" />
       <circle cx="32" cy="32" r="6" fill="#fff" />
+    </svg>
+  );
+}
+
+function DocumentsIcon() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+      <polyline points="14 2 14 8 20 8" />
+      <line x1="8" x2="16" y1="13" y2="13" />
+      <line x1="8" x2="14" y1="17" y2="17" />
     </svg>
   );
 }

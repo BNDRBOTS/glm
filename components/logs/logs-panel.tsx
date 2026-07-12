@@ -39,6 +39,7 @@ const SOURCE_LABELS: Record<string, string> = {
   skill: "Skill",
   auth: "Auth",
   system: "System",
+  rag: "RAG",
 };
 
 const LEVEL_COLORS: Record<string, string> = {

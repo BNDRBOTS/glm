@@ -15,8 +15,31 @@
  */
 
 import { getCurrentUserId } from "./nextauth";
+import { db } from "@/lib/db";
 
 export const DEMO_USER_ID = "demo-user";
+
+/**
+ * Ensure the demo user row exists before a route writes rows that
+ * reference it. Real users always exist (they signed in); the demo
+ * user is synthetic and must be materialized on first write —
+ * previously only /api/chat did this, so uploading a document before
+ * sending the first chat message failed with an FK violation.
+ */
+export async function ensureUserRow(userId: string): Promise<void> {
+  if (userId !== DEMO_USER_ID) return;
+  await db.user.upsert({
+    where: { id: DEMO_USER_ID },
+    create: {
+      id: DEMO_USER_ID,
+      email: "demo@local",
+      name: "Demo",
+      passwordHash: "demo-no-auth",
+      role: "OWNER",
+    },
+    update: {},
+  });
+}
 
 /**
  * Returns true if demo mode is allowed in the current environment.

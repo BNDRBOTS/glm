@@ -20,6 +20,8 @@ import { db } from "@/lib/db";
 import { isDemoModeAllowed, DEMO_USER_ID } from "@/lib/auth/require-user";
 import { isBillingConfigured } from "@/lib/billing/stripe";
 import { isVoiceAvailable } from "@/lib/voice";
+import { resolveEmbeddingProvider } from "@/lib/rag/embeddings";
+import { resolveRagDriver } from "@/lib/rag/retriever";
 
 export const runtime = "nodejs";
 
@@ -56,7 +58,12 @@ export async function GET() {
     user,
     demoMode: demoAllowed && !realUserId,
     glmConfigured: Boolean(process.env.ZAI_API_KEY),
+    deepseekConfigured: Boolean(process.env.DEEPSEEK_API_KEY),
     voiceConfigured: isVoiceAvailable(),
     billingConfigured: isBillingConfigured(),
+    rag: {
+      embeddingsProvider: resolveEmbeddingProvider(),
+      driver: resolveRagDriver(),
+    },
   });
 }

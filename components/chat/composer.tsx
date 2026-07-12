@@ -28,6 +28,8 @@ export function Composer({ onSend, disabled, attachments, onAttachmentsChange }:
   const fileRef = React.useRef<HTMLInputElement>(null);
   const model = useChatStore((s) => s.model);
   const setModel = useChatStore((s) => s.setModel);
+  const ragEnabled = useChatStore((s) => s.ragEnabled);
+  const setRagEnabled = useChatStore((s) => s.setRagEnabled);
   const recorder = useVoiceRecorder();
   const { toast } = useToast();
 
@@ -194,6 +196,28 @@ export function Composer({ onSend, disabled, attachments, onAttachmentsChange }:
               </button>
 
               <ModelPicker model={model} setModel={setModel} disabled={disabled} />
+
+              <button
+                type="button"
+                onClick={() => setRagEnabled(!ragEnabled)}
+                disabled={disabled}
+                className={cn(
+                  "flex h-9 items-center gap-1.5 rounded-lg px-3 text-[13px] font-medium press-smooth disabled:opacity-50",
+                  ragEnabled
+                    ? "glass text-foreground"
+                    : "text-muted-foreground hover:bg-foreground/5 hover:text-foreground"
+                )}
+                aria-pressed={ragEnabled}
+                aria-label={ragEnabled ? "Disable document grounding" : "Enable document grounding"}
+                title={
+                  ragEnabled
+                    ? "Docs ON — answers cite your uploaded documents"
+                    : "Docs OFF — answers ignore your documents"
+                }
+              >
+                <BookIcon />
+                <span className="hidden sm:inline">Docs</span>
+              </button>
             </div>
 
             <button
@@ -213,7 +237,8 @@ export function Composer({ onSend, disabled, attachments, onAttachmentsChange }:
         </div>
 
         <div className="mt-2 text-center text-[10px] text-muted-foreground">
-          GLM 5.2 peak reasoning · Enter to send · Shift+Enter for newline
+          {MODELS.find((m) => m.id === model)?.label ?? "GLM 5.2"}
+          {ragEnabled ? " · document grounding on" : ""} · Enter to send · Shift+Enter for newline
         </div>
       </div>
     </div>
@@ -230,6 +255,10 @@ function ModelPicker({
   disabled?: boolean;
 }) {
   const active = MODELS.find((m) => m.id === model) ?? MODELS[0];
+  const providers: { key: "zai" | "deepseek"; label: string }[] = [
+    { key: "zai", label: "GLM (Z.ai)" },
+    { key: "deepseek", label: "DeepSeek" },
+  ];
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
@@ -244,25 +273,29 @@ function ModelPicker({
         </button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="start" className="w-72">
-        <DropdownMenuLabel className="text-[10px] uppercase tracking-[0.18em] text-muted-foreground">
-          Model
-        </DropdownMenuLabel>
-        <DropdownMenuSeparator />
-        {MODELS.map((m) => (
-          <DropdownMenuItem
-            key={m.id}
-            onClick={() => setModel(m.id)}
-            className="flex flex-col items-start gap-1 py-2"
-          >
-            <div className="flex w-full items-center justify-between">
-              <div className="flex items-center gap-2">
-                <TierDot tier={m.tier} />
-                <span className="font-medium">{m.label}</span>
-              </div>
-              {m.id === model && <CheckIcon />}
-            </div>
-            <p className="pl-5 text-xs text-muted-foreground">{m.description}</p>
-          </DropdownMenuItem>
+        {providers.map((p, pi) => (
+          <React.Fragment key={p.key}>
+            {pi > 0 && <DropdownMenuSeparator />}
+            <DropdownMenuLabel className="text-[10px] uppercase tracking-[0.18em] text-muted-foreground">
+              {p.label}
+            </DropdownMenuLabel>
+            {MODELS.filter((m) => m.provider === p.key).map((m) => (
+              <DropdownMenuItem
+                key={m.id}
+                onClick={() => setModel(m.id)}
+                className="flex flex-col items-start gap-1 py-2"
+              >
+                <div className="flex w-full items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <TierDot tier={m.tier} />
+                    <span className="font-medium">{m.label}</span>
+                  </div>
+                  {m.id === model && <CheckIcon />}
+                </div>
+                <p className="pl-5 text-xs text-muted-foreground">{m.description}</p>
+              </DropdownMenuItem>
+            ))}
+          </React.Fragment>
         ))}
       </DropdownMenuContent>
     </DropdownMenu>
@@ -329,6 +362,14 @@ function FileIcon() {
     <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
       <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
       <polyline points="14 2 14 8 20 8" />
+    </svg>
+  );
+}
+
+function BookIcon() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1 0-5H20" />
     </svg>
   );
 }

@@ -162,6 +162,7 @@ export default function HomePage() {
           text,
           mode,
           fullBuildOnly,
+          ragEnabled: store.ragEnabled,
           skillId: activeSkillId,
           groupId: pendingGroupId,
           attachments: await Promise.all(
@@ -210,6 +211,25 @@ export default function HomePage() {
                 setMessages((prev) =>
                   prev.map((m) =>
                     m.id === assistantMsg.id ? { ...m, content: m.content + evt.token } : m
+                  )
+                );
+                break;
+              case "thinking":
+                // Reasoning-trace tokens (deepseek-reasoner / GLM
+                // thinking) — accumulated separately from content.
+                setMessages((prev) =>
+                  prev.map((m) =>
+                    m.id === assistantMsg.id
+                      ? { ...m, thinking: (m.thinking ?? "") + evt.token, thinkingStreaming: true }
+                      : m
+                  )
+                );
+                break;
+              case "sources":
+                // RAG source citations arrive before the first token.
+                setMessages((prev) =>
+                  prev.map((m) =>
+                    m.id === assistantMsg.id ? { ...m, sources: evt.sources } : m
                   )
                 );
                 break;
@@ -305,7 +325,9 @@ export default function HomePage() {
               case "done":
                 setMessages((prev) =>
                   prev.map((m) =>
-                    m.id === assistantMsg.id ? { ...m, streaming: false, tokens: evt.tokens } : m
+                    m.id === assistantMsg.id
+                      ? { ...m, streaming: false, thinkingStreaming: false, tokens: evt.tokens }
+                      : m
                   )
                 );
                 break;
@@ -377,6 +399,8 @@ export default function HomePage() {
             content: m.content,
             model: m.model ?? undefined,
             tokens: m.tokens ?? undefined,
+            thinking: m.thinking ?? undefined,
+            sources: Array.isArray(m.sources) ? m.sources : undefined,
             createdAt: m.createdAt,
           }))
         );
@@ -505,6 +529,13 @@ export default function HomePage() {
       }},
       { id: "open-themes", label: "Open theme switcher", group: "View" as const, run: () => (window as any).__openThemes?.() },
       { id: "open-canvas", label: "Open code canvas", group: "Tools" as const, run: () => (window as any).__openCanvas?.() },
+      { id: "open-documents", label: "Open documents", group: "Tools" as const, run: () => (window as any).__openDocuments?.() },
+      { id: "toggle-rag", label: "Toggle document grounding (RAG)", group: "Mode" as const, run: () => {
+        // Read live state — this memoized closure would otherwise
+        // capture a stale ragEnabled snapshot.
+        const s = useChatStore.getState();
+        s.setRagEnabled(!s.ragEnabled);
+      }},
       { id: "open-connectors", label: "Open connectors", group: "Tools" as const, run: () => (window as any).__openIntegrations?.() },
       { id: "open-skills", label: "Open skills", group: "Tools" as const, run: () => (window as any).__openSkills?.() },
       { id: "open-logs", label: "Open audit log", group: "Tools" as const, run: () => (window as any).__openLogs?.() },

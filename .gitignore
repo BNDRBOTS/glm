@@ -19,3 +19,5 @@ Thumbs.db
 *.swo
 .railway/
 .zscripts/
+tsconfig.tsbuildinfo
+*.tsbuildinfo
