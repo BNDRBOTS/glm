@@ -31,8 +31,14 @@ export type AttachmentStorage = "LOCAL" | "S3";
 const DEFAULT_DIR = path.join(process.cwd(), "data", "attachments");
 
 function getRoot(): string {
-  const dir = process.env.ATTACHMENTS_DIR ?? DEFAULT_DIR;
-  return path.resolve(dir);
+  // Keep the statically-scoped default OUT of any dynamic path
+  // expression: when the project-root-derived constant flows through
+  // path.resolve with a runtime value, Turbopack's file tracer
+  // concludes the route may read anywhere under the project and drags
+  // the whole repo into the standalone output (NFT warning). The env
+  // branch is purely runtime data, which the tracer ignores.
+  const custom = process.env.ATTACHMENTS_DIR;
+  return custom ? path.resolve(custom) : DEFAULT_DIR;
 }
 
 async function ensureRoot(): Promise<string> {

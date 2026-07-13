@@ -98,6 +98,10 @@ export function BillingPanel({ open, onOpenChange, billingConfigured }: BillingP
   }, []);
 
   React.useEffect(() => {
+    // Fetch-on-open with a loading flag. The lint rule traces setState
+    // into async continuations, which would forbid all effect-based
+    // data fetching — a pattern react.dev explicitly documents as valid.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     if (open) refresh();
   }, [open, refresh]);
 
@@ -111,7 +115,7 @@ export function BillingPanel({ open, onOpenChange, billingConfigured }: BillingP
       });
       const j = await r.json();
       if (j.url) {
-        window.location.href = j.url;
+        window.location.assign(j.url);
         return;
       }
       toast({
@@ -136,7 +140,7 @@ export function BillingPanel({ open, onOpenChange, billingConfigured }: BillingP
       });
       const j = await r.json();
       if (j.url) {
-        window.location.href = j.url;
+        window.location.assign(j.url);
         return;
       }
       toast({

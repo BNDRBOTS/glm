@@ -82,6 +82,11 @@ export default function HomePage() {
   }, []);
 
   React.useEffect(() => {
+    // Mount-time data fetching. All setState calls happen after awaited
+    // fetches; the lint rule traces setState into async continuations,
+    // which would forbid all effect-based data fetching — a pattern
+    // react.dev explicitly documents as valid.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     refreshChats();
     refreshSession();
     Promise.all([
@@ -395,6 +400,7 @@ export default function HomePage() {
             model: m.model ?? undefined,
             tokens: m.tokens ?? undefined,
             createdAt: m.createdAt,
+            attachments: Array.isArray(m.attachments) && m.attachments.length > 0 ? m.attachments : undefined,
           }))
         );
       }

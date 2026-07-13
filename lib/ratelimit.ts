@@ -12,7 +12,7 @@
  * logged via console.warn so operators see it.
  *
  * Limits are defined per-route-bucket. Buckets are matched by URL
- * prefix in middleware.ts. Each bucket has:
+ * prefix in proxy.ts. Each bucket has:
  *   - max: max requests in the window
  *   - windowSec: window size in seconds
  *   - scope: "user" | "ip" — whether to key by authenticated user or

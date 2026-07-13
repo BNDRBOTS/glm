@@ -19,11 +19,13 @@ import { useToast } from "@/hooks/use-toast";
 import { THEMES, applyTheme, loadPersistedTheme, type ThemeDefinition } from "@/lib/themes";
 
 export function ThemeSwitcher({ open, onOpenChange }: { open: boolean; onOpenChange: (v: boolean) => void }) {
-  const [active, setActive] = React.useState<string>("obsidian");
-
-  React.useEffect(() => {
-    setActive(loadPersistedTheme());
-  }, []);
+  // Lazy initializer reads the persisted theme once on the client.
+  // The dialog content only renders after user interaction (open starts
+  // false), so this cannot cause a hydration mismatch, and it removes
+  // the setState-in-effect cascade the mount effect had.
+  const [active, setActive] = React.useState<string>(() =>
+    typeof window === "undefined" ? "obsidian" : loadPersistedTheme()
+  );
 
   function handleSelect(theme: ThemeDefinition) {
     setActive(theme.id);

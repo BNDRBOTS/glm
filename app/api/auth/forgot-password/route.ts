@@ -15,7 +15,7 @@
  *   4. Send the email via lib/email.ts (SMTP if configured, console
  *      fallback otherwise).
  *
- * Rate limited at 3/hour per IP via middleware.
+ * Rate limited at 3/hour per IP via proxy.ts.
  *
  * Token TTL: 1 hour.
  */

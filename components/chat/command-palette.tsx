@@ -28,13 +28,17 @@ export function CommandPalette({
   const [query, setQuery] = React.useState("");
   const [activeIdx, setActiveIdx] = React.useState(0);
 
-  // Reset on open
-  React.useEffect(() => {
+  // Reset transient input state whenever the palette (re)opens.
+  // Done during render (react.dev "adjusting state when a prop
+  // changes") instead of an effect — no extra render cascade.
+  const [prevOpen, setPrevOpen] = React.useState(open);
+  if (open !== prevOpen) {
+    setPrevOpen(open);
     if (open) {
       setQuery("");
       setActiveIdx(0);
     }
-  }, [open]);
+  }
 
   const filtered = React.useMemo(() => {
     if (!query.trim()) return actions;

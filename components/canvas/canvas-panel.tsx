@@ -46,12 +46,17 @@ export function CanvasPanel({
   const [source, setSource] = React.useState(state?.source ?? defaultHtml);
   const [saving, setSaving] = React.useState(false);
 
-  React.useEffect(() => {
+  // Adjust local editor state when the parent-provided snapshot changes.
+  // Done during render (react.dev "adjusting state when a prop changes")
+  // instead of an effect — avoids the extra render cascade.
+  const [prevState, setPrevState] = React.useState(state);
+  if (state !== prevState) {
+    setPrevState(state);
     if (state) {
       setKind(state.kind);
       setSource(state.source);
     }
-  }, [state]);
+  }
 
   // Load most recent snapshot when the panel opens for an existing chat
   // (and there's no in-memory state yet).
@@ -86,7 +91,6 @@ export function CanvasPanel({
       }
     })();
     return () => { cancelled = true; };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, chatId]);
 
   const sandboxDoc = React.useMemo(() => {

@@ -1,5 +1,5 @@
 /**
- * Next.js middleware.
+ * Next.js proxy (the Next 16 name for the middleware file convention).
  * ---------------------------------------------------------------------
  * Runs on every request before the route handler. Currently:
  *   1. Resolves the client IP (X-Forwarded-For or connection remote).
@@ -26,7 +26,7 @@ export const config = {
   ],
 };
 
-export async function middleware(req: NextRequest) {
+export async function proxy(req: NextRequest) {
   // Skip health — Railway pings it every few seconds, would burn limit.
   if (req.nextUrl.pathname === "/api/health") {
     return NextResponse.next();

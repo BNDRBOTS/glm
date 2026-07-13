@@ -79,7 +79,9 @@ export async function POST(req: NextRequest) {
   const name = body.name.trim().slice(0, 100);
   let slug = body.slug?.trim() ? slugify(body.slug) : slugify(name);
 
-  // Ensure slug uniqueness
+  // Ensure slug uniqueness. The check-then-create below still has a
+  // race window under concurrent creates — the create is wrapped in a
+  // P2002 retry to close it.
   let suffix = 0;
   while (await db.group.findUnique({ where: { slug } })) {
     suffix++;
@@ -106,22 +108,34 @@ export async function POST(req: NextRequest) {
     }
   }
 
-  const group = await db.group.create({
-    data: {
-      name,
-      slug,
-      description: body.description?.trim().slice(0, 500) ?? null,
-      members: {
-        create: [
-          { userId: uid, role: "OWNER" },
-          ...memberRows,
-        ],
+  const createGroup = (slugToUse: string) =>
+    db.group.create({
+      data: {
+        name,
+        slug: slugToUse,
+        description: body.description?.trim().slice(0, 500) ?? null,
+        members: {
+          create: [
+            { userId: uid, role: "OWNER" },
+            ...memberRows,
+          ],
+        },
       },
-    },
-    include: {
-      members: { select: { userId: true, role: true, user: { select: { email: true, name: true } } } },
-    },
-  });
+      include: {
+        members: { select: { userId: true, role: true, user: { select: { email: true, name: true } } } },
+      },
+    });
+
+  let group;
+  try {
+    group = await createGroup(slug);
+  } catch (e: any) {
+    // P2002 = slug collided with a concurrent create between the
+    // uniqueness check above and this insert. Retry once with a
+    // random suffix instead of failing the request.
+    if (e?.code !== "P2002") throw e;
+    group = await createGroup(`${slug}-${Math.random().toString(36).slice(2, 8)}`);
+  }
 
   await logAudit({
     userId: uid,

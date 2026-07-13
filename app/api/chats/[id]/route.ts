@@ -58,7 +58,7 @@ export async function GET(
 
   const messages = await db.message.findMany({
     where: { chatId: chat.id },
-    orderBy: { createdAt: "asc" },
+    orderBy: [{ createdAt: "asc" }, { id: "asc" }],
     select: {
       id: true,
       role: true,
@@ -67,6 +67,9 @@ export async function GET(
       totalTokens: true,
       createdAt: true,
       authorId: true,
+      attachments: {
+        select: { id: true, filename: true, mimeType: true, size: true },
+      },
     },
   });
 
@@ -102,6 +105,7 @@ export async function GET(
       tokens: m.totalTokens,
       createdAt: m.createdAt.toISOString(),
       authorId: m.authorId,
+      attachments: m.attachments,
     })),
   });
 }

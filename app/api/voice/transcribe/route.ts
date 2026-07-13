@@ -24,6 +24,25 @@ export async function POST(req: NextRequest) {
   const [userId, denied] = await requireUser();
   if (denied) return denied;
 
+  // Validate the request BEFORE the configuration gate — a malformed
+  // request is a 400 regardless of whether STT keys are present.
+  const form = await req.formData();
+  const file = form.get("file");
+  const rawProvider = form.get("provider");
+  if (rawProvider !== null && rawProvider !== "zai" && rawProvider !== "openai") {
+    return NextResponse.json(
+      { error: `Unknown provider "${String(rawProvider)}" — use "zai" or "openai".` },
+      { status: 400 }
+    );
+  }
+  const provider: STTProvider = rawProvider === "openai" ? "openai" : "zai";
+  const language = (form.get("language") as string | null) ?? undefined;
+  const prompt = (form.get("prompt") as string | null) ?? undefined;
+
+  if (!file || !(file instanceof Blob)) {
+    return NextResponse.json({ error: "Missing audio file" }, { status: 400 });
+  }
+
   if (!isVoiceAvailable()) {
     return NextResponse.json(
       {
@@ -32,16 +51,6 @@ export async function POST(req: NextRequest) {
       },
       { status: 503 }
     );
-  }
-
-  const form = await req.formData();
-  const file = form.get("file");
-  const provider = (form.get("provider") as STTProvider | null) ?? "zai";
-  const language = (form.get("language") as string | null) ?? undefined;
-  const prompt = (form.get("prompt") as string | null) ?? undefined;
-
-  if (!file || !(file instanceof Blob)) {
-    return NextResponse.json({ error: "Missing audio file" }, { status: 400 });
   }
 
   // Cap audio size to prevent abuse (10 MB).

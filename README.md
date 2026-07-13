@@ -182,23 +182,32 @@ A cloud-deployed chat platform with: GLM 5.2 streaming, two isolated accounts, c
 ```
 app/
   api/
-    auth/seed/            — create the two starting accounts
+    attachments/[id]/     — download an uploaded attachment (access-checked)
     audit/                — unified audit log query + prune
+    auth/
+      [...nextauth]/      — NextAuth credentials sign-in
+      change-password/    — verify current + set new password
+      delete-account/     — irreversible account deletion (email-confirmed)
+      forgot-password/    — reset link (hash-at-rest tokens)
+      reset-password/     — consume reset token
+      seed/               — dev-only account bootstrap (404s in production)
+      signup/             — self-service account creation
     backends/             — backend integration save/list
     billing/
       checkout/           — Stripe checkout session
       portal/             — Stripe customer portal
       webhook/            — Stripe webhook (real signature verification)
+    canvas/[chatId]/      — canvas snapshot list/save
     chat/                 — streaming chat (quality checker + distillation + skills + audit)
+    chats/                — list chats (paginated); [id]/ — load/rename/pin/delete
     connectors/           — connector save/list/test
     dashboard/            — token usage stats
-    distillation/         — live distillation state
+    distillation/         — live distillation state (badge restore)
     exports/              — raw + aggregated export
-    health/               — Railway healthcheck
-    integrations/         — legacy (routes to connectors)
-    skills/
-      [id]/               — skill CRUD
-        export/           — skill JSON export
+    groups/               — groups CRUD; [id]/members — role-gated membership
+    health/               — Railway healthcheck + dependency status
+    session/              — session truth for the UI
+    skills/               — list/create/import; [id]/ — CRUD; [id]/export — JSON export
     voice/transcribe/     — STT (Z.ai ASR + Whisper)
   layout.tsx              — root with ThemeProvider + PWA
   page.tsx                — the chat interface (everything wired)

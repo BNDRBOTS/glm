@@ -78,6 +78,10 @@ export function GroupsPanel({ open, onOpenChange, onStartGroupChat }: GroupsPane
   }, []);
 
   React.useEffect(() => {
+    // Fetch-on-open with a loading flag. The lint rule traces setState
+    // into async continuations, which would forbid all effect-based
+    // data fetching — a pattern react.dev explicitly documents as valid.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     if (open) refresh();
   }, [open, refresh]);
 

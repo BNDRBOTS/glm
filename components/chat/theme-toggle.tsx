@@ -4,10 +4,18 @@ import * as React from "react";
 import { useTheme } from "next-themes";
 import { cn } from "@/lib/utils";
 
+// Hydration detector: server snapshot is false, client snapshot is
+// true, so the first client render matches SSR output and the theme
+// icon appears right after hydration — same behavior as the old
+// setMounted-in-effect pattern without the extra render cascade.
+const emptySubscribe = () => () => {};
+function useMounted() {
+  return React.useSyncExternalStore(emptySubscribe, () => true, () => false);
+}
+
 export function ThemeToggle({ className }: { className?: string }) {
   const { theme, setTheme } = useTheme();
-  const [mounted, setMounted] = React.useState(false);
-  React.useEffect(() => setMounted(true), []);
+  const mounted = useMounted();
 
   const isDark = theme === "dark";
 
