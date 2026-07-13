@@ -46,7 +46,10 @@ export async function POST(req: NextRequest) {
 
   if (user) {
     try {
-      // Generate raw token + hash. Store only the hash.
+      // Generate raw token + hash. Store ONLY the hash — the raw token
+      // goes out in the email and must never touch the database, or a
+      // DB leak becomes an account-takeover kit. The legacy `token`
+      // column (kept for schema compatibility) also stores the hash.
       const rawToken = randomBytes(32).toString("hex");
       const tokenHash = createHash("sha256").update(rawToken).digest("hex");
       const expiresAt = new Date(Date.now() + TOKEN_TTL_MS);
@@ -57,10 +60,16 @@ export async function POST(req: NextRequest) {
         data: { usedAt: new Date() },
       });
 
+      // Opportunistic hygiene: purge tokens that expired over a day
+      // ago (used or not) so the table stays bounded over years of use.
+      await db.passwordResetToken.deleteMany({
+        where: { expiresAt: { lt: new Date(Date.now() - 24 * 60 * 60 * 1000) } },
+      });
+
       await db.passwordResetToken.create({
         data: {
           userId: user.id,
-          token: rawToken, // also stored raw for the @unique constraint; hash is the verified one
+          token: tokenHash,
           tokenHash,
           expiresAt,
         },

@@ -149,17 +149,30 @@ A cloud-deployed chat platform with: GLM 5.2 streaming, two isolated accounts, c
 1. **Security hole**: `/api/chat` had `userId ?? "demo-user"` fallback. Now gated behind `ENABLE_DEMO_MODE=1` env var.
 2. **CORS / allowedDevOrigins**: dev log warning fixed via `next.config.ts`.
 3. **Stream abort handling**: client navigating away cancels server stream via `AbortController`.
-4. **`server-only` package**: replaced with testing-friendly `src/lib/server-guard.ts`.
+4. **`server-only` package**: replaced with testing-friendly `lib/server-guard.ts`.
 5. **Slop in backends**: 4 files had "install X then uncomment" stubs. All rewritten with REAL implementations using lazy-loaded SDKs.
 6. **Slop in Stripe**: 2 stub functions. Rewritten with REAL SDK calls, feature-flagged.
 7. **Distillation field name mismatch**: `overallAlignment` vs `alignment` caused NaN badge. Fixed.
 8. **UsageLog missing Chat relation**: dashboard query crashed. Schema fixed.
 9. **firebase-admin transitively needs @opentelemetry/api**: installed.
+10. **Missing skills + distillation API routes**: the UI called `/api/skills`, `/api/skills/[id]`, `/api/skills/[id]/export` and the README promised `/api/distillation` — none existed. All four restored; the intent-drift badge now also survives reloads by refetching server-side state.
+11. **Chat context truncation**: history loaded the *oldest* 40 messages, so chats past 40 turns never showed the model recent context — including the message just sent. Now loads the most recent 40.
+12. **Password reset token stored raw in DB**: defeated the hash-at-rest design; a DB leak was an account-takeover kit. Only the SHA-256 hash is stored now (raw token exists only in the email).
+13. **Sign-in brute force unprotected**: the rate-limit bucket covered `/api/auth/signin`, but NextAuth credentials sign-in actually POSTs to `/api/auth/callback/credentials`. Bucket added for the real path (verified live: 429 after 5 attempts/min).
+14. **Per-user rate limiting silently broken**: middleware tried to decode the session cookie as a 3-part JWT, but NextAuth v4 issues a 5-part encrypted JWE — the parse always failed and every "user"-scoped limit degraded to per-IP. Now keys by a SHA-256 fingerprint of the session cookie.
+15. **Attachments stored under `.next/`**: every rebuild deleted all user uploads. Moved to `data/attachments` (set `ATTACHMENTS_DIR` to a mounted volume in prod). Files are also cleaned up when a chat or account is deleted — previously they leaked forever.
+16. **Path-boundary checks used `startsWith`**: `/data/attachments-evil` passed the check for root `/data/attachments`. Both attachment storage and the Local FS connector now use proper `path.relative` containment.
+17. **Aborted/errored streams lost data**: client disconnect or stream error left an empty assistant row in the transcript and dropped every streamed token. Partial output is now persisted with a `truncated` turnLog marker; rows that never received content are removed.
+18. **Memory journal hardening**: assistant turns were misattributed to the user in MemoryLog payloads, a null author would have violated the User foreign key, and a journal failure crashed the whole turn. Owner/author are now recorded separately and journal failures degrade to an audit-log entry.
+19. **Audit auto-prune actually wired**: the 10K-per-user cap was only enforced if someone manually hit DELETE /api/audit. ~1 in 500 writes now triggers a background per-user prune.
+20. **Group privilege boundary**: any MEMBER could add members and even grant ADMIN. Adding members now requires OWNER/ADMIN; granting ADMIN requires OWNER. Deleting your account no longer strands memberless orphan groups.
+21. **Build required production secrets**: `next build` evaluated the NextAuth config and threw without `NEXTAUTH_SECRET`, breaking CI builds. The fail-fast now happens at server boot instead (`NEXT_PHASE` aware).
+22. **`/api/chat` input hardening**: malformed JSON 500'd; unbounded text/base64 could exhaust memory before size checks ran. Now validated and capped up front. Client aborts also propagate to the upstream GLM request instead of burning tokens on a response nobody sees.
 
 ## Slots ready for later (not built — by design)
 
-- **Pinecone memory mesh** — `extractDeep()` in `src/lib/memory/index.ts` is the single swap point.
-- **Behavioral wrappers** — `applyWrappers()` in `src/lib/ai/client.ts` is the hook. (Skills already use this via `systemPrefix`.)
+- **Pinecone memory mesh** — `extractDeep()` in `lib/memory/index.ts` is the single swap point.
+- **Behavioral wrappers** — `applyWrappers()` in `lib/ai/client.ts` is the hook. (Skills already use this via `systemPrefix`.)
 - **More group members** — `GroupMember` already supports unlimited members.
 - **Redis for distillation state** — current in-memory Map works for single-instance Railway.
 - **Skill marketplace** — Skills can already be exported/imported as JSON. Marketplace UI is the only missing piece.
@@ -167,64 +180,63 @@ A cloud-deployed chat platform with: GLM 5.2 streaming, two isolated accounts, c
 ## Project structure
 
 ```
-src/
-  app/
-    api/
-      auth/seed/            — create the two starting accounts
-      audit/                — unified audit log query + prune
-      backends/             — backend integration save/list
-      billing/
-        checkout/           — Stripe checkout session
-        portal/             — Stripe customer portal
-        webhook/            — Stripe webhook (real signature verification)
-      chat/                 — streaming chat (quality checker + distillation + skills + audit)
-      connectors/           — connector save/list/test
-      dashboard/            — token usage stats
-      distillation/         — live distillation state
-      exports/              — raw + aggregated export
-      health/               — Railway healthcheck
-      integrations/         — legacy (routes to connectors)
-      skills/
-        [id]/               — skill CRUD
-          export/           — skill JSON export
-      voice/transcribe/     — STT (Z.ai ASR + Whisper)
-    layout.tsx              — root with ThemeProvider + PWA
-    page.tsx                — the chat interface (everything wired)
-    globals.css             — ultra-deep #000 dark + glassmorphism + Apple-clean light
-  components/
-    chat/                   — message, composer (with mic), sidebar, container, mode-picker, command-palette, intent-drift-badge, theme-toggle
-    chat/dashboard/         — token usage dashboard
-    canvas/                 — code canvas panel
-    integrations/           — connectors panel
-    logs/                   — audit log panel
-    skills/                 — skills panel (maker/accepter/reader)
-    themes/                 — theme switcher
-    theme-provider.tsx      — next-themes wrapper
-    ui/                     — shadcn/ui components
-  hooks/
-    use-voice-recorder.ts   — MediaRecorder hook
-  lib/
-    ai/                     — GLM client + model catalog
-    audit/                  — unified audit log (write/query/prune)
-    auth/                   — NextAuth + password hashing + crypto
-    backends/               — Supabase/Neon/MongoDB/Firebase/Turso REAL adapters
-    billing/                — Stripe REAL implementation
-    canvas/                 — canvas state + sandbox doc builder
-    connectors/             — CourtListener/Midpage/Courtroom5/Notion/GitHub/LocalFS adapters
-    distillation/           — real-time intent + entity/fact/decision extraction
-    memory/                 — turn-by-turn JSON logging + deep aggregator
-    permissions/            — auto/plan/accept-edits modes + slop detector
-    quality/                — silent AI checker with retry orchestrator
-    server-guard.ts         — testing-friendly server-only replacement
-    skills/                 — skill maker/accepter/reader + trigger matching
-    themes/                 — 5 premade themes + apply/load
-    voice/                  — Z.ai ASR + OpenAI Whisper
-    wcag.ts                 — WCAG 2.1 contrast calculator + audit
-  stores/
-    chat-store.ts           — Zustand client state
-  tests/
-    index.ts                — 56 smoke + sanity + WCAG tests
-    preload.ts              — Bun plugin for test environment
+app/
+  api/
+    auth/seed/            — create the two starting accounts
+    audit/                — unified audit log query + prune
+    backends/             — backend integration save/list
+    billing/
+      checkout/           — Stripe checkout session
+      portal/             — Stripe customer portal
+      webhook/            — Stripe webhook (real signature verification)
+    chat/                 — streaming chat (quality checker + distillation + skills + audit)
+    connectors/           — connector save/list/test
+    dashboard/            — token usage stats
+    distillation/         — live distillation state
+    exports/              — raw + aggregated export
+    health/               — Railway healthcheck
+    integrations/         — legacy (routes to connectors)
+    skills/
+      [id]/               — skill CRUD
+        export/           — skill JSON export
+    voice/transcribe/     — STT (Z.ai ASR + Whisper)
+  layout.tsx              — root with ThemeProvider + PWA
+  page.tsx                — the chat interface (everything wired)
+  globals.css             — ultra-deep #000 dark + glassmorphism + Apple-clean light
+components/
+  chat/                   — message, composer (with mic), sidebar, container, mode-picker, command-palette, intent-drift-badge, theme-toggle
+  chat/dashboard/         — token usage dashboard
+  canvas/                 — code canvas panel
+  integrations/           — connectors panel
+  logs/                   — audit log panel
+  skills/                 — skills panel (maker/accepter/reader)
+  themes/                 — theme switcher
+  theme-provider.tsx      — next-themes wrapper
+  ui/                     — shadcn/ui components
+hooks/
+  use-voice-recorder.ts   — MediaRecorder hook
+lib/
+  ai/                     — GLM client + model catalog
+  audit/                  — unified audit log (write/query/prune)
+  auth/                   — NextAuth + password hashing + crypto
+  backends/               — Supabase/Neon/MongoDB/Firebase/Turso REAL adapters
+  billing/                — Stripe REAL implementation
+  canvas/                 — canvas state + sandbox doc builder
+  connectors/             — CourtListener/Midpage/Courtroom5/Notion/GitHub/LocalFS adapters
+  distillation/           — real-time intent + entity/fact/decision extraction
+  memory/                 — turn-by-turn JSON logging + deep aggregator
+  permissions/            — auto/plan/accept-edits modes + slop detector
+  quality/                — silent AI checker with retry orchestrator
+  server-guard.ts         — testing-friendly server-only replacement
+  skills/                 — skill maker/accepter/reader + trigger matching
+  themes/                 — 5 premade themes + apply/load
+  voice/                  — Z.ai ASR + OpenAI Whisper
+  wcag.ts                 — WCAG 2.1 contrast calculator + audit
+stores/
+  chat-store.ts           — Zustand client state
+tests/
+  index.ts                — 71 smoke + sanity + WCAG + regression tests
+  preload.ts              — Bun plugin for test environment
 prisma/
   schema.prisma             — User, Chat, Message, Group, Integration, MemoryLog, UsageLog, CanvasState, Skill, AuditLog
 public/
@@ -242,7 +254,7 @@ SETUP-GUIDE.md              — dummy-proof step-by-step
 bun run tests/index.ts
 ```
 
-Runs 56 smoke + sanity + WCAG tests covering:
+Runs 71 smoke + sanity + WCAG + regression tests covering:
 - Models catalog (no 4.6, has 5.1 + flash)
 - Connectors registry (6 connectors, CourtListener + Midpage manifests)
 - Backends registry (5 backends, Supabase required fields)
@@ -270,7 +282,7 @@ Runs 56 smoke + sanity + WCAG tests covering:
 - Nike-smooth transitions on every interactive element
 - PWA — installs to dock/start menu, no browser chrome
 - Mobile-first responsive throughout (including canvas + settings)
-- Server-only secrets (`src/lib/server-guard.ts`)
+- Server-only secrets (`lib/server-guard.ts`)
 - Intent is never abstracted away — frozen from first user message
 - Slop is never silently delivered — checker retries or warns
 - Black/gray/charcoal base + 2-4 accent colors only — no rainbow palettes

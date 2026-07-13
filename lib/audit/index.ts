@@ -62,7 +62,14 @@ export interface AuditLogRow {
 /**
  * Write an audit log entry. Never throws — if DB write fails, the
  * error is swallowed to avoid crashing the calling request.
+ *
+ * Auto-prune: roughly 1 in 500 writes triggers a fire-and-forget
+ * per-user prune so the "last 10K per user" cap is actually enforced
+ * during normal operation, not only when someone remembers to hit
+ * DELETE /api/audit.
  */
+const AUTO_PRUNE_PROBABILITY = 1 / 500;
+
 export async function logAudit(entry: AuditEntry): Promise<void> {
   try {
     await db.auditLog.create({
@@ -75,6 +82,11 @@ export async function logAudit(entry: AuditEntry): Promise<void> {
         chatId: entry.chatId ?? null,
       },
     });
+    if (entry.userId && Math.random() < AUTO_PRUNE_PROBABILITY) {
+      // Deliberately not awaited — pruning must never add latency to
+      // the calling request. Errors are swallowed (next write retries).
+      void pruneUserLogs(entry.userId).catch(() => {});
+    }
   } catch (e) {
     // Audit log failure must NEVER crash the calling code path.
     // Surface in stderr for ops, but continue.
@@ -82,6 +94,27 @@ export async function logAudit(entry: AuditEntry): Promise<void> {
       console.error("[audit] write failed:", (e as Error).message);
     }
   }
+}
+
+/**
+ * Prune audit logs for a single user — keep the most recent
+ * `maxPerUser`. Safe for multi-tenant callers (only touches one
+ * user's rows). Used by the auto-prune above and DELETE /api/audit.
+ */
+export async function pruneUserLogs(userId: string, maxPerUser = 10_000): Promise<number> {
+  const count = await db.auditLog.count({ where: { userId } });
+  if (count <= maxPerUser) return 0;
+  const cutoff = await db.auditLog.findFirst({
+    where: { userId },
+    orderBy: { createdAt: "desc" },
+    skip: maxPerUser - 1,
+    select: { createdAt: true },
+  });
+  if (!cutoff) return 0;
+  const result = await db.auditLog.deleteMany({
+    where: { userId, createdAt: { lt: cutoff.createdAt } },
+  });
+  return result.count;
 }
 
 /**
@@ -136,25 +169,7 @@ export async function pruneOldLogs(maxPerUser = 10_000): Promise<number> {
   let totalDeleted = 0;
   for (const u of users) {
     if (!u.userId) continue;
-    const count = await db.auditLog.count({ where: { userId: u.userId } });
-    if (count <= maxPerUser) continue;
-
-    // Find the cutoff timestamp
-    const cutoff = await db.auditLog.findFirst({
-      where: { userId: u.userId },
-      orderBy: { createdAt: "desc" },
-      skip: maxPerUser - 1,
-      select: { createdAt: true },
-    });
-    if (!cutoff) continue;
-
-    const result = await db.auditLog.deleteMany({
-      where: {
-        userId: u.userId,
-        createdAt: { lt: cutoff.createdAt },
-      },
-    });
-    totalDeleted += result.count;
+    totalDeleted += await pruneUserLogs(u.userId, maxPerUser);
   }
   return totalDeleted;
 }

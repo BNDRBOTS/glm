@@ -51,6 +51,12 @@ export interface ChatRequest {
   systemSuffix?: string;
   // GLM 5.2 reasoning toggle — on by default for peak tier
   thinking?: boolean;
+  /**
+   * Abort signal — when the caller (e.g. a disconnecting client)
+   * aborts, the upstream request is cancelled too instead of burning
+   * tokens on a response nobody will receive.
+   */
+  signal?: AbortSignal;
 }
 
 const ZAI_BASE_URL = "https://api.z.ai/api/paas/v4";
@@ -110,6 +116,7 @@ export class GLMClient {
           Authorization: `Bearer ${this.apiKey}`,
         },
         body: JSON.stringify(body),
+        signal: req.signal,
       });
 
       if (!res.ok || !res.body) {

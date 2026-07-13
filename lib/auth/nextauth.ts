@@ -30,16 +30,38 @@ export const authOptions: NextAuthOptions = {
       },
       async authorize(creds) {
         if (!creds?.email || !creds?.password) return null;
-        const user = await db.user.findUnique({
-          where: { email: creds.email.toLowerCase() },
-        });
-        if (!user) return null;
-        const ok = verifyPassword(creds.password, user.passwordHash);
-        if (!ok) return null;
+        const email = creds.email.toLowerCase();
+        const user = await db.user.findUnique({ where: { email } });
+        if (!user || !verifyPassword(creds.password, user.passwordHash)) {
+          // Audit failed attempts so brute-force patterns are visible.
+          // Same log shape whether the account exists or not — the
+          // audit trail must not become an account-enumeration oracle
+          // if it's ever exposed more broadly.
+          const { logAudit } = await import("@/lib/audit");
+          await logAudit({
+            userId: user?.id ?? null,
+            source: "auth",
+            level: "warn",
+            event: "user.signin_failed",
+            payload: { email },
+          });
+          return null;
+        }
         return { id: user.id, email: user.email, name: user.name ?? undefined };
       },
     }),
   ],
+  events: {
+    async signIn({ user }) {
+      const { logAudit } = await import("@/lib/audit");
+      await logAudit({
+        userId: user.id,
+        source: "auth",
+        event: "user.signin",
+        payload: { email: user.email },
+      });
+    },
+  },
   callbacks: {
     async jwt({ token, user }) {
       if (user) {
@@ -70,7 +92,13 @@ export const authOptions: NextAuthOptions = {
 function getAuthSecret(): string {
   const secret = process.env.NEXTAUTH_SECRET;
   if (secret && secret.length >= 16) return secret;
-  if (process.env.NODE_ENV === "production") {
+  // `next build` evaluates this module during page-data collection with
+  // NODE_ENV=production — throwing there means the app can't even BUILD
+  // without production secrets present (breaks CI and any build step
+  // that doesn't inject runtime env). Fail fast at SERVER BOOT instead:
+  // NEXT_PHASE is only set during the build itself.
+  const isBuildPhase = process.env.NEXT_PHASE === "phase-production-build";
+  if (process.env.NODE_ENV === "production" && !isBuildPhase) {
     throw new Error(
       "NEXTAUTH_SECRET must be set to a 16+ char random string in production. " +
       "Generate one with: openssl rand -hex 32"

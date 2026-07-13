@@ -11,6 +11,8 @@ dist/
 db/
 *.db
 *.db-journal
+# Local attachment storage (see lib/storage/attachments.ts)
+data/
 .DS_Store
 Thumbs.db
 .vscode/
@@ -19,3 +21,4 @@ Thumbs.db
 *.swo
 .railway/
 .zscripts/
+*.tsbuildinfo

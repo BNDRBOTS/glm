@@ -8,7 +8,7 @@
  */
 
 import { NextRequest, NextResponse } from "next/server";
-import { queryAuditLogs, pruneOldLogs, type AuditSource, type AuditLevel } from "@/lib/audit";
+import { queryAuditLogs, pruneUserLogs, type AuditSource, type AuditLevel } from "@/lib/audit";
 import { requireUser } from "@/lib/auth/require-user";
 
 export const runtime = "nodejs";
@@ -45,32 +45,9 @@ export async function GET(req: NextRequest) {
 export async function DELETE() {
   const [userId, denied] = await requireUser();
   if (denied) return denied;
-  // pruneOldLogs currently iterates ALL users in the DB. Restrict to
-  // the requesting user's logs to prevent one user from deleting
-  // another's audit trail. The lib function is per-user already —
-  // we pass userId to scope it explicitly.
-  const deleted = await pruneOldLogsForUser(userId!);
+  // User-scoped prune only — one user must never be able to delete
+  // another's audit trail. (lib/audit's pruneOldLogs iterates all
+  // users and is reserved for operator scripts.)
+  const deleted = await pruneUserLogs(userId!);
   return NextResponse.json({ pruned: deleted });
-}
-
-/**
- * Prune audit logs for a single user — keep last 10,000.
- * This is a user-scoped variant of pruneOldLogs; the lib version
- * iterates ALL users which is unsafe for a multi-tenant endpoint.
- */
-async function pruneOldLogsForUser(userId: string, maxPerUser = 10_000): Promise<number> {
-  const { db } = await import("@/lib/db");
-  const count = await db.auditLog.count({ where: { userId } });
-  if (count <= maxPerUser) return 0;
-  const cutoff = await db.auditLog.findFirst({
-    where: { userId },
-    orderBy: { createdAt: "desc" },
-    skip: maxPerUser - 1,
-    select: { createdAt: true },
-  });
-  if (!cutoff) return 0;
-  const result = await db.auditLog.deleteMany({
-    where: { userId, createdAt: { lt: cutoff.createdAt } },
-  });
-  return result.count;
 }

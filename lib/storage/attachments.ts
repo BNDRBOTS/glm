@@ -2,22 +2,33 @@
  * Attachment storage helper.
  * ---------------------------------------------------------------------
  * Stores uploaded files for chat messages. Default backend is LOCAL
- * (file system) under ATTACHMENTS_DIR or ./.next/attachments as a
+ * (file system) under ATTACHMENTS_DIR or ./data/attachments as a
  * fallback. The Attachment row records storage + storageKey so a
  * future S3 swap is mechanical — only this file changes.
  *
+ * PERSISTENCE: the default directory intentionally lives OUTSIDE
+ * .next/ — the build output is deleted and recreated on every
+ * `next build`, so anything stored there is silently wiped on each
+ * deploy. `data/attachments` survives rebuilds; on Railway mount a
+ * volume at ATTACHMENTS_DIR for durability across container restarts.
+ *
  * SECURITY: filenames are sanitized + a random uuid is prepended so
  * two uploads with the same name never collide, and a malicious
- * filename can't traverse the filesystem.
+ * filename can't traverse the filesystem. Path containment uses
+ * path.relative (see lib/fs-boundary.ts) — a plain startsWith prefix
+ * check would accept sibling directories like `<root>-evil`.
  */
 
 import { promises as fs } from "fs";
 import * as path from "path";
 import { randomUUID } from "crypto";
+import { isInsideRoot, resolveInsideRoot } from "@/lib/fs-boundary";
 
 export type AttachmentStorage = "LOCAL" | "S3";
 
-const DEFAULT_DIR = path.resolve(process.cwd(), ".next/attachments");
+// Statically scoped join so Turbopack's file tracer doesn't try to
+// trace the whole project directory into the build output.
+const DEFAULT_DIR = path.join(process.cwd(), "data", "attachments");
 
 function getRoot(): string {
   const dir = process.env.ATTACHMENTS_DIR ?? DEFAULT_DIR;
@@ -57,12 +68,9 @@ export async function storeAttachment(
   const safeName = sanitizeFilename(filename);
   const id = randomUUID();
   const storageKey = `${id}-${safeName}`;
-  const full = path.resolve(root, storageKey);
 
   // Defense-in-depth: ensure resolved path stays inside root.
-  if (!full.startsWith(root)) {
-    throw new Error("Path traversal blocked");
-  }
+  const full = resolveInsideRoot(root, storageKey);
 
   await fs.writeFile(full, data);
   return {
@@ -79,8 +87,8 @@ export async function storeAttachment(
  */
 export async function readAttachment(storageKey: string): Promise<Buffer | null> {
   const root = getRoot();
+  if (!isInsideRoot(root, storageKey)) return null;
   const full = path.resolve(root, storageKey);
-  if (!full.startsWith(root)) return null;
   try {
     return await fs.readFile(full);
   } catch {
@@ -95,11 +103,30 @@ export async function readAttachment(storageKey: string): Promise<Buffer | null>
  */
 export async function deleteAttachment(storageKey: string): Promise<void> {
   const root = getRoot();
+  if (!isInsideRoot(root, storageKey)) return;
   const full = path.resolve(root, storageKey);
-  if (!full.startsWith(root)) return;
   try {
     await fs.unlink(full);
   } catch {
     // ignore — file may already be gone
+  }
+}
+
+/**
+ * Best-effort disk cleanup for a batch of attachment rows. Never
+ * throws — orphaned files are a hygiene issue, not a correctness one,
+ * and the caller (chat/account deletion) must not fail because of a
+ * missing file.
+ */
+export async function deleteAttachmentFiles(
+  rows: { storage: string; storageKey: string }[]
+): Promise<void> {
+  for (const row of rows) {
+    if (row.storage !== "LOCAL") continue;
+    try {
+      await deleteAttachment(row.storageKey);
+    } catch {
+      // best-effort
+    }
   }
 }

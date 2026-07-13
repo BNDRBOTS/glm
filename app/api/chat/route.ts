@@ -52,8 +52,16 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  const body = await req.json();
-  const { chatId, model, text, mode, fullBuildOnly, skillId, attachments, groupId } = body as {
+  let body: unknown;
+  try {
+    body = await req.json();
+  } catch {
+    return new Response(JSON.stringify({ error: "Invalid JSON body" }), {
+      status: 400,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+  const { chatId, model, text, mode, fullBuildOnly, skillId, attachments, groupId } = (body ?? {}) as {
     chatId?: string;
     model?: string;
     text: string;
@@ -67,10 +75,31 @@ export async function POST(req: NextRequest) {
   if (!text || typeof text !== "string") {
     return new Response(JSON.stringify({ error: "Missing text" }), { status: 400 });
   }
+  // Cap message length — an unbounded string would be persisted whole
+  // and blow both the DB row and the model context.
+  const MAX_TEXT_CHARS = 200_000;
+  if (text.length > MAX_TEXT_CHARS) {
+    return new Response(
+      JSON.stringify({ error: `Message too long (max ${MAX_TEXT_CHARS} characters)` }),
+      { status: 413 }
+    );
+  }
+  // Optional fields must be the right shape when present.
+  for (const [name, val] of [["chatId", chatId], ["model", model], ["skillId", skillId], ["groupId", groupId]] as const) {
+    if (val !== undefined && typeof val !== "string") {
+      return new Response(JSON.stringify({ error: `Invalid ${name}` }), { status: 400 });
+    }
+  }
+  if (attachments !== undefined && !Array.isArray(attachments)) {
+    return new Response(JSON.stringify({ error: "Invalid attachments" }), { status: 400 });
+  }
 
   // Cap attachment count + total size to prevent abuse.
   const MAX_ATTACHMENTS = 10;
   const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024; // 10 MB per file
+  // Base64 inflates ~4/3 — reject oversized payloads BEFORE decoding
+  // so a huge string can't force a giant Buffer allocation.
+  const MAX_ATTACHMENT_B64_CHARS = Math.ceil(MAX_ATTACHMENT_BYTES * (4 / 3)) + 8;
   if (attachments && attachments.length > MAX_ATTACHMENTS) {
     return new Response(
       JSON.stringify({ error: `Too many attachments (max ${MAX_ATTACHMENTS})` }),
@@ -198,9 +227,11 @@ export async function POST(req: NextRequest) {
   // TS narrows it for all downstream usage.
   const activeChat = chat;
 
-  // Persist user message
+  // Persist user message. authorId uses the EFFECTIVE user id so
+  // demo-mode turns aren't stored authorless (which downstream code
+  // treats as "assistant-authored").
   const userMsg = await db.message.create({
-    data: { chatId: activeChat.id, authorId: userId, role: "user", content: text },
+    data: { chatId: activeChat.id, authorId: effectiveUserId, role: "user", content: text },
   });
 
   // Persist attachments (if any) and link them to the user message.
@@ -208,7 +239,10 @@ export async function POST(req: NextRequest) {
   // is base64-encoded. We decode + store to disk + record the row.
   if (attachments && attachments.length > 0) {
     for (const att of attachments) {
-      if (!att.filename || !att.data) continue;
+      if (!att || typeof att !== "object") continue;
+      if (!att.filename || typeof att.filename !== "string") continue;
+      if (!att.data || typeof att.data !== "string") continue;
+      if (att.data.length > MAX_ATTACHMENT_B64_CHARS) continue; // reject before decoding
       let buf: Buffer;
       try {
         buf = Buffer.from(att.data, "base64");
@@ -246,6 +280,7 @@ export async function POST(req: NextRequest) {
     messageId: userMsg.id,
     chatId: activeChat.id,
     authorId: effectiveUserId,
+    ownerId: effectiveUserId,
     role: "user",
     content: text,
   });
@@ -262,12 +297,19 @@ export async function POST(req: NextRequest) {
   await setDistillationState(activeChat.id, _distillState);
   let distillState: DistillationState = _distillState;
 
-  // Load history (turn-by-turn JSON memory)
+  // Load history (turn-by-turn JSON memory).
+  // CONTEXT INTEGRITY: take the MOST RECENT 40 turns. The previous
+  // `orderBy asc + take 40` returned the OLDEST 40, so once a chat
+  // passed 40 messages the model never saw recent turns — including
+  // the message the user just sent. Order desc, then reverse back to
+  // chronological. Empty-content rows (aborted placeholder turns) are
+  // excluded so they don't waste context.
   const priorTurns = await db.message.findMany({
-    where: { chatId: activeChat.id },
-    orderBy: { createdAt: "asc" },
+    where: { chatId: activeChat.id, NOT: { content: "" } },
+    orderBy: [{ createdAt: "desc" }, { id: "desc" }],
     take: 40,
   });
+  priorTurns.reverse();
   const messages: ChatTurn[] = priorTurns.map((m) => ({
     role: m.role as ChatTurn["role"],
     content: m.content,
@@ -284,8 +326,21 @@ export async function POST(req: NextRequest) {
         data: { chatId: activeChat.id, authorId: null, role: "assistant", content: "", model: effectiveModel },
       });
 
-      const send = (obj: unknown) =>
-        controller.enqueue(encoder.encode(`data: ${JSON.stringify(obj)}\n\n`));
+      // The controller throws if used after close (and close throws if
+      // called twice — previously the abort path closed, then `finally`
+      // closed again, erroring the stream). Guard both.
+      let closed = false;
+      const safeClose = () => {
+        if (closed) return;
+        closed = true;
+        try { controller.close(); } catch { /* already closed */ }
+      };
+      const send = (obj: unknown) => {
+        if (closed) return;
+        try {
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(obj)}\n\n`));
+        } catch { /* client gone — persistence below still runs */ }
+      };
 
       send({ type: "start", chatId: activeChat.id, messageId: assistantMsg.id });
 
@@ -297,17 +352,66 @@ export async function POST(req: NextRequest) {
       const onAbort = () => { aborted = true; };
       signal.addEventListener("abort", onAbort);
 
+      // DATA LOSS GUARD: if the turn ends early (client disconnect or
+      // stream error), persist whatever was already generated instead
+      // of leaving an empty assistant row + dropping streamed tokens.
+      // If nothing arrived at all, remove the placeholder row so the
+      // transcript and exports aren't polluted with blank turns.
+      const persistPartial = async (reason: "aborted" | "error", errText?: string) => {
+        try {
+          if (full.trim().length > 0) {
+            await db.message.update({
+              where: { id: assistantMsg.id },
+              data: {
+                content: full,
+                promptTokens: usage?.promptTokens,
+                completionTokens: usage?.completionTokens,
+                totalTokens: usage?.totalTokens,
+                turnLog: JSON.stringify({ truncated: true, reason, ...(errText ? { error: errText } : {}) }),
+              },
+            });
+            await logTurn({
+              messageId: assistantMsg.id,
+              chatId: activeChat.id,
+              authorId: null,
+              ownerId: effectiveUserId,
+              role: "assistant",
+              content: full,
+              model: effectiveModel,
+              truncated: true,
+            });
+          } else {
+            await db.message.delete({ where: { id: assistantMsg.id } });
+          }
+        } catch (persistErr) {
+          await logAudit({
+            userId: effectiveUserId,
+            source: "chat",
+            level: "error",
+            event: "chat.partial_persist_failed",
+            payload: { chatId: activeChat.id, messageId: assistantMsg.id, reason, error: String(persistErr) },
+            chatId: activeChat.id,
+          });
+        }
+      };
+
       try {
-        // First pass: stream to user live
+        // First pass: stream to user live. Tokens are accumulated here
+        // (not only in onDone) so an aborted stream still has the
+        // partial text available for persistence.
+        let firstPass = "";
         await client.stream(
           {
             model: effectiveModel,
             messages,
             temperature: 0.7,
             systemPrefix: combinedSystemPrefix ?? undefined,
+            signal,
           },
           {
             onToken: (token) => {
+              firstPass += token;
+              full = firstPass;
               if (aborted) return;
               send({ type: "token", token });
             },
@@ -320,7 +424,8 @@ export async function POST(req: NextRequest) {
         );
 
         if (aborted) {
-          controller.close();
+          await persistPartial("aborted");
+          safeClose();
           return;
         }
 
@@ -343,7 +448,7 @@ export async function POST(req: NextRequest) {
                 ];
                 let retryFull = "";
                 await client.stream(
-                  { model: effectiveModel, messages: retryMsgs, temperature: 0.5 },
+                  { model: effectiveModel, messages: retryMsgs, temperature: 0.5, signal },
                   {
                     onToken: (t) => { if (!aborted) send({ type: "token", token: t }); },
                     onDone: (f) => { retryFull = f; },
@@ -452,7 +557,8 @@ export async function POST(req: NextRequest) {
           }
 
           if (aborted) {
-            controller.close();
+            await persistPartial("aborted");
+            safeClose();
             return;
           }
 
@@ -481,6 +587,7 @@ export async function POST(req: NextRequest) {
               messages: synthesisMessages,
               temperature: 0.5,
               systemPrefix: combinedSystemPrefix ?? undefined,
+              signal,
             },
             {
               onToken: (t) => { if (!aborted) send({ type: "token", token: t }); },
@@ -517,7 +624,7 @@ export async function POST(req: NextRequest) {
             },
           });
           send({ type: "done", tokens: usage?.totalTokens, gated: true });
-          controller.close();
+          safeClose();
           return;
         }
 
@@ -534,7 +641,7 @@ export async function POST(req: NextRequest) {
             },
           });
           send({ type: "done", tokens: usage?.totalTokens, gated: true });
-          controller.close();
+          safeClose();
           return;
         }
 
@@ -548,7 +655,7 @@ export async function POST(req: NextRequest) {
             },
           });
           send({ type: "done", tokens: usage?.totalTokens, rejected: true });
-          controller.close();
+          safeClose();
           return;
         }
 
@@ -566,7 +673,10 @@ export async function POST(req: NextRequest) {
         await logTurn({
           messageId: assistantMsg.id,
           chatId: activeChat.id,
-          authorId: effectiveUserId,
+          // Assistant turns have no human author; the memory row is
+          // still owned by (scoped to) the effective user.
+          authorId: null,
+          ownerId: effectiveUserId,
           role: "assistant",
           content: full,
           model: effectiveModel,
@@ -629,22 +739,31 @@ export async function POST(req: NextRequest) {
 
         send({ type: "done", tokens: usage?.totalTokens });
       } catch (e) {
-        await logAudit({
-          userId: effectiveUserId,
-          source: "chat",
-          level: "error",
-          event: "chat.error",
-          payload: { chatId: activeChat.id, error: String(e) },
-          chatId: activeChat.id,
-        });
-        send({ type: "error", error: String(e) });
+        // A client abort surfaces here as an AbortError from the
+        // upstream fetch — treat it as an abort (persist partial),
+        // not an application error.
+        if (aborted || signal.aborted) {
+          await persistPartial("aborted");
+        } else {
+          await persistPartial("error", String(e));
+          await logAudit({
+            userId: effectiveUserId,
+            source: "chat",
+            level: "error",
+            event: "chat.error",
+            payload: { chatId: activeChat.id, error: String(e) },
+            chatId: activeChat.id,
+          });
+          send({ type: "error", error: String(e) });
+        }
       } finally {
         signal.removeEventListener("abort", onAbort);
-        controller.close();
+        safeClose();
       }
     },
     cancel() {
-      // Client disconnected — stream will be GC'd
+      // Client disconnected — req.signal fires and the abort path
+      // persists any partial output.
     },
   });
 

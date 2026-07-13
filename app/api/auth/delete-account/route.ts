@@ -24,6 +24,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import { getCurrentUserId } from "@/lib/auth/nextauth";
 import { logAudit } from "@/lib/audit";
+import { deleteAttachmentFiles } from "@/lib/storage/attachments";
 
 export const runtime = "nodejs";
 
@@ -67,16 +68,29 @@ export async function POST(req: NextRequest) {
     },
   });
 
+  const soleOwnedGroupIds: string[] = [];
   for (const g of ownedGroups) {
     if (g.members.length > 0) {
       await db.groupMember.update({
         where: { groupId_userId: { groupId: g.id, userId: g.members[0].userId } },
         data: { role: "OWNER" },
       });
+    } else {
+      // No other members. Deleting the user only cascades the
+      // GroupMember rows — the Group row itself would survive as an
+      // orphan (memberless, unreachable by any query that filters on
+      // membership). Track it for explicit deletion below.
+      soleOwnedGroupIds.push(g.id);
     }
-    // If no other members, the group will be deleted via cascade when
-    // the user's GroupMember rows are removed.
   }
+
+  // Collect attachment files for chats this user owns BEFORE the
+  // cascade removes the rows — otherwise the files leak on disk with
+  // nothing left pointing at them.
+  const attachmentRows = await db.attachment.findMany({
+    where: { chat: { ownerId: userId } },
+    select: { storage: true, storageKey: true },
+  });
 
   // Log BEFORE deletion so we have the userId in the audit trail.
   await logAudit({
@@ -84,10 +98,27 @@ export async function POST(req: NextRequest) {
     source: "auth",
     level: "warn",
     event: "user.account_deleted",
-    payload: { email: user.email, ownedGroupsTransferred: ownedGroups.length },
+    payload: {
+      email: user.email,
+      ownedGroupsTransferred: ownedGroups.length - soleOwnedGroupIds.length,
+      groupsDeleted: soleOwnedGroupIds.length,
+      attachmentFiles: attachmentRows.length,
+    },
   });
 
   await db.user.delete({ where: { id: userId } });
+
+  // Remove groups that are now memberless. Re-check the count so a
+  // concurrently-added member keeps the group alive.
+  for (const groupId of soleOwnedGroupIds) {
+    const remaining = await db.groupMember.count({ where: { groupId } });
+    if (remaining === 0) {
+      await db.group.delete({ where: { id: groupId } }).catch(() => {});
+    }
+  }
+
+  // Best-effort disk cleanup — DB rows are already gone via cascade.
+  await deleteAttachmentFiles(attachmentRows);
 
   return NextResponse.json({ ok: true });
 }

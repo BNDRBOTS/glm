@@ -618,6 +618,200 @@ await test("power plan is free (price 0)", async () => {
 });
 
 // ---------------------------------------------------------------------
+// Filesystem path boundary (attachments + Local FS connector)
+// ---------------------------------------------------------------------
+
+console.log("\nFilesystem path boundary");
+await test("isInsideRoot accepts paths inside the root", async () => {
+  const { isInsideRoot } = await import("@/lib/fs-boundary");
+  ok(isInsideRoot("/data/attachments", "abc-file.txt"));
+  ok(isInsideRoot("/data/attachments", "sub/dir/file.txt"));
+  ok(isInsideRoot("/data/attachments", "/data/attachments/file.txt"));
+});
+
+await test("isInsideRoot rejects parent-directory traversal", async () => {
+  const { isInsideRoot } = await import("@/lib/fs-boundary");
+  ok(!isInsideRoot("/data/attachments", "../outside.txt"));
+  ok(!isInsideRoot("/data/attachments", "../../etc/passwd"));
+  ok(!isInsideRoot("/data/attachments", "sub/../../outside.txt"));
+});
+
+await test("isInsideRoot rejects sibling-prefix escape (startsWith bug)", async () => {
+  const { isInsideRoot } = await import("@/lib/fs-boundary");
+  // "/data/attachments-evil/x" starts with "/data/attachments" but is
+  // NOT inside it — the old prefix check accepted this.
+  ok(!isInsideRoot("/data/attachments", "/data/attachments-evil/x"));
+  ok(!isInsideRoot("/data/attachments", "../attachments-evil/x"));
+});
+
+await test("resolveInsideRoot throws on escape, resolves when safe", async () => {
+  const { resolveInsideRoot } = await import("@/lib/fs-boundary");
+  const safe = resolveInsideRoot("/data/attachments", "uuid-file.txt");
+  ok(safe.endsWith("uuid-file.txt"));
+  let threw = false;
+  try {
+    resolveInsideRoot("/data/attachments", "../../etc/passwd");
+  } catch {
+    threw = true;
+  }
+  ok(threw, "escape should throw");
+});
+
+await test("attachment store/read/delete round-trip stays inside root", async () => {
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const fs = await import("node:fs/promises");
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "glm-att-test-"));
+  const orig = process.env.ATTACHMENTS_DIR;
+  process.env.ATTACHMENTS_DIR = dir;
+  try {
+    const { storeAttachment, readAttachment, deleteAttachment } = await import("@/lib/storage/attachments");
+    const stored = await storeAttachment("../../evil name.txt", "text/plain", Buffer.from("hello"));
+    ok(!stored.storageKey.includes(".."), "storageKey must be sanitized");
+    const back = await readAttachment(stored.storageKey);
+    eq(back?.toString("utf8"), "hello");
+    // Traversal reads return null instead of leaking files
+    const escape = await readAttachment("../outside.txt");
+    eq(escape, null);
+    await deleteAttachment(stored.storageKey);
+    eq(await readAttachment(stored.storageKey), null);
+  } finally {
+    if (orig === undefined) delete process.env.ATTACHMENTS_DIR;
+    else process.env.ATTACHMENTS_DIR = orig;
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+await test("default attachments dir is NOT under .next (build-wipe hazard)", async () => {
+  const fs = await import("node:fs/promises");
+  const src = await fs.readFile(new URL("../lib/storage/attachments.ts", import.meta.url), "utf8");
+  ok(!/DEFAULT_DIR\s*=\s*[^\n]*\.next/.test(src), "default dir must live outside .next/");
+});
+
+// ---------------------------------------------------------------------
+// Rate limit buckets — the paths that actually take auth traffic
+// ---------------------------------------------------------------------
+
+console.log("\nRate limit buckets");
+await test("NextAuth credentials callback path is rate limited", async () => {
+  const { RATE_LIMITS } = await import("@/lib/ratelimit");
+  const bucket = RATE_LIMITS["POST:/api/auth/callback/credentials"];
+  ok(bucket, "credentials callback bucket must exist — that is the real sign-in POST path");
+  ok(bucket.max <= 10, "sign-in bucket should be strict");
+  eq(bucket.scope, "ip");
+});
+
+await test("sensitive account mutations have strict buckets", async () => {
+  const { RATE_LIMITS } = await import("@/lib/ratelimit");
+  ok(RATE_LIMITS["POST:/api/auth/change-password"], "change-password bucket");
+  ok(RATE_LIMITS["POST:/api/auth/delete-account"], "delete-account bucket");
+});
+
+await test("checkRateLimit blocks after bucket max", async () => {
+  const { resetRedisForTests } = await import("@/lib/redis");
+  await resetRedisForTests();
+  const { checkRateLimit } = await import("@/lib/ratelimit");
+  const opts = { method: "POST", path: "/api/auth/callback/credentials", userId: null, ip: "203.0.113.9" };
+  let last;
+  for (let i = 0; i < 6; i++) last = await checkRateLimit(opts);
+  ok(last && !last.allowed, "6th sign-in attempt in a minute must be blocked");
+  await resetRedisForTests();
+});
+
+// ---------------------------------------------------------------------
+// Memory journal — attribution + fault isolation
+// ---------------------------------------------------------------------
+
+console.log("\nMemory journal");
+await test("logTurn never throws, even without a database", async () => {
+  const { logTurn } = await import("@/lib/memory");
+  // No DATABASE_URL in the test env — the create will fail. logTurn
+  // must swallow it (the Message table is the authoritative store).
+  await logTurn({
+    messageId: "m1",
+    chatId: "c1",
+    authorId: null,
+    ownerId: "owner-1",
+    role: "assistant",
+    content: "partial output",
+    truncated: true,
+  });
+  ok(true, "should not throw");
+});
+
+await test("TurnRecord separates authorId from ownerId", async () => {
+  const mod = await import("@/lib/memory");
+  // Type-level contract: a record with assistant authorship null +
+  // owner set compiles and is accepted by logTurn.
+  const rec: Parameters<typeof mod.logTurn>[0] = {
+    messageId: "m2",
+    chatId: "c2",
+    authorId: null,
+    ownerId: "owner-2",
+    role: "assistant",
+    content: "x",
+  };
+  await mod.logTurn(rec);
+  ok(true);
+});
+
+// ---------------------------------------------------------------------
+// In-memory redis — TTL + sweep behavior
+// ---------------------------------------------------------------------
+
+console.log("\nIn-memory redis");
+await test("expired keys read as null", async () => {
+  const { getRedis, resetRedisForTests } = await import("@/lib/redis");
+  await resetRedisForTests();
+  const redis = await getRedis();
+  await redis.set("t:expired", "v", -1); // already expired
+  eq(await redis.get("t:expired"), null);
+  await resetRedisForTests();
+});
+
+await test("incr counts within a window", async () => {
+  const { getRedis, resetRedisForTests } = await import("@/lib/redis");
+  await resetRedisForTests();
+  const redis = await getRedis();
+  eq(await redis.incr("t:counter", 60), 1);
+  eq(await redis.incr("t:counter", 60), 2);
+  eq(await redis.incr("t:counter", 60), 3);
+  await resetRedisForTests();
+});
+
+// ---------------------------------------------------------------------
+// Tool-call parsing — output cleaning stays lossless for prose
+// ---------------------------------------------------------------------
+
+console.log("\nTool-call parsing");
+await test("parseToolCalls extracts calls and cleans output", async () => {
+  const { parseToolCalls } = await import("@/lib/tools/connector-calls");
+  const output = [
+    "Let me search for that.",
+    "```tool:connector:search",
+    '{ "provider": "github", "query": "next-auth", "limit": 5 }',
+    "```",
+    "One moment.",
+  ].join("\n");
+  const parsed = parseToolCalls(output);
+  eq(parsed.calls.length, 1);
+  eq(parsed.calls[0].provider, "github");
+  eq(parsed.calls[0].kind, "search");
+  ok(!parsed.cleaned.includes("tool:connector"), "directive removed from visible output");
+  ok(parsed.cleaned.includes("Let me search for that."), "prose preserved");
+  ok(parsed.cleaned.includes("One moment."), "prose preserved");
+});
+
+await test("parseToolCalls skips malformed JSON without dropping prose", async () => {
+  const { parseToolCalls } = await import("@/lib/tools/connector-calls");
+  const output = "Before\n```tool:connector:search\n{ not json\n```\nAfter";
+  const parsed = parseToolCalls(output);
+  eq(parsed.calls.length, 0);
+  ok(parsed.cleaned.includes("Before"));
+  ok(parsed.cleaned.includes("After"));
+});
+
+// ---------------------------------------------------------------------
 // Summary
 // ---------------------------------------------------------------------
 
