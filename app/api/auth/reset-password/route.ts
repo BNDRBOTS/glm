@@ -15,7 +15,7 @@
  *      password reset is rare enough that this is acceptable. The
  *      user should sign out other devices manually.)
  *
- * Rate limited at 5/hour per IP via middleware.
+ * Rate limited at 5/hour per IP via proxy.ts.
  */
 
 import { NextRequest, NextResponse } from "next/server";

@@ -14,6 +14,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import { requireUser } from "@/lib/auth/require-user";
+import { deleteAttachmentFiles } from "@/lib/storage/attachments";
 
 export const runtime = "nodejs";
 
@@ -57,7 +58,7 @@ export async function GET(
 
   const messages = await db.message.findMany({
     where: { chatId: chat.id },
-    orderBy: { createdAt: "asc" },
+    orderBy: [{ createdAt: "asc" }, { id: "asc" }],
     select: {
       id: true,
       role: true,
@@ -68,6 +69,9 @@ export async function GET(
       sources: true,
       createdAt: true,
       authorId: true,
+      attachments: {
+        select: { id: true, filename: true, mimeType: true, size: true },
+      },
     },
   });
 
@@ -110,6 +114,7 @@ export async function GET(
         sources,
         createdAt: m.createdAt.toISOString(),
         authorId: m.authorId,
+        attachments: m.attachments,
       };
     }),
   });
@@ -224,6 +229,15 @@ export async function DELETE(
     return NextResponse.json({ error: "Chat not found or not owned by you" }, { status: 404 });
   }
 
+  // Snapshot attachment file keys before the cascade deletes the rows,
+  // then clean the files best-effort after — otherwise every deleted
+  // chat leaks its uploads on disk forever.
+  const attachmentRows = await db.attachment.findMany({
+    where: { chatId: id },
+    select: { storage: true, storageKey: true },
+  });
+
   await db.chat.delete({ where: { id } });
+  await deleteAttachmentFiles(attachmentRows);
   return NextResponse.json({ ok: true });
 }

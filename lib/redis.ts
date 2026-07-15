@@ -157,6 +157,24 @@ class RealRedis implements RedisLike {
 
 class InMemoryRedis implements RedisLike {
   private store = new Map<string, { value: string; expiresAt?: number }>();
+  private lastSweep = 0;
+
+  // Expired entries are only removed lazily on get(); under sustained
+  // traffic with high-cardinality keys (rate-limit buckets per IP),
+  // the map would otherwise grow without bound. Sweep opportunistically
+  // when the map is large, at most once a minute.
+  private static readonly SWEEP_THRESHOLD = 5_000;
+  private static readonly SWEEP_MIN_INTERVAL_MS = 60_000;
+
+  private maybeSweep(): void {
+    const now = Date.now();
+    if (this.store.size < InMemoryRedis.SWEEP_THRESHOLD) return;
+    if (now - this.lastSweep < InMemoryRedis.SWEEP_MIN_INTERVAL_MS) return;
+    this.lastSweep = now;
+    for (const [key, entry] of this.store) {
+      if (entry.expiresAt && entry.expiresAt < now) this.store.delete(key);
+    }
+  }
 
   async get(key: string): Promise<string | null> {
     const entry = this.store.get(key);
@@ -169,6 +187,7 @@ class InMemoryRedis implements RedisLike {
   }
 
   async set(key: string, value: string, ttlSeconds?: number): Promise<void> {
+    this.maybeSweep();
     this.store.set(key, {
       value,
       expiresAt: ttlSeconds ? Date.now() + ttlSeconds * 1000 : undefined,

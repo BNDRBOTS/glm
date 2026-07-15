@@ -80,10 +80,16 @@ If you want OpenAI Whisper as a voice fallback (optional), get a separate key at
 
 6. Click **Settings** → **Add service** → **Database** → **PostgreSQL**.
    Railway creates it and sets `DATABASE_URL` automatically.
-7. Open `prisma/schema.prisma` in your GitHub repo. Change line 27 from
-   `provider = "sqlite"` to `provider = "postgresql"`. Save.
-8. In Railway, click your app service → **Settings** → **Build** →
-   set the build command to: `bun install && bun run db:push`
+7. **Don't change the build settings.** You also don't need to edit
+   `prisma/schema.prisma` — the provider (sqlite vs postgresql) is
+   swapped automatically from `DATABASE_URL`, and the database schema
+   is pushed automatically every time the server starts
+   (see the `start` script in `package.json`).
+8. (Recommended) Click **Settings** → **Volumes** → add a volume and
+   mount it at `/app/data`. Chat attachments are stored under
+   `data/attachments`; without a volume they are lost when the
+   container is replaced. To use a different mount path, set the
+   `ATTACHMENTS_DIR` variable to it.
 9. Click **Deploy**. Wait ~3 minutes.
 10. Visit the URL Railway gives you. The app loads.
 
@@ -91,24 +97,22 @@ If you want OpenAI Whisper as a voice fallback (optional), get a separate key at
 
 ## Step 4 — Create your two accounts (1 minute)
 
-The app starts with no users. To create the two starting accounts,
-open Terminal on your computer and run these (replace with your
-real emails and passwords):
+The app starts with no users. Create the two starting accounts through
+the sign-up page:
 
-```bash
-curl -X POST https://YOUR-APP-NAME.up.railway.app/api/auth/seed \
-  -H "Content-Type: application/json" \
-  -d '{"email":"you@yourdomain.com","password":"your-password","name":"You","role":"OWNER"}'
+1. Visit `https://YOUR-APP-NAME.up.railway.app/signup` and create your
+   account.
+2. Have your buddy do the same (or create theirs yourself).
 
-curl -X POST https://YOUR-APP-NAME.up.railway.app/api/auth/seed \
-  -H "Content-Type: application/json" \
-  -d '{"email":"buddy@yourdomain.com","password":"buddy-password","name":"Buddy","role":"BUDDY"}'
-```
+> Note: the `/api/auth/seed` endpoint is intentionally disabled in
+> production (it returns 404 regardless of flags) — it exists only for
+> local development bootstrapping.
 
 That's it. Both accounts exist. Both are fully separate.
 
-Once that's done, set `DISABLE_SEED=1` in Railway variables so nobody
-else can create accounts via that endpoint.
+Once that's done, set `DISABLE_SIGNUP=1` in Railway variables so nobody
+else can create accounts on your instance. Existing accounts can still
+sign in.
 
 ---
 

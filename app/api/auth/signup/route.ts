@@ -8,7 +8,7 @@
  *   - Password >= 8 chars (matches the seed endpoint policy)
  *   - Email lowercased + trimmed
  *
- * Rate limited at 3/hour per IP via middleware.ts (RATE_LIMITS key).
+ * Rate limited at 3/hour per IP via proxy.ts (RATE_LIMITS key).
  *
  * Returns: { ok: true, userId, email } on success.
  *          { ok: false, error } on validation failure or duplicate.

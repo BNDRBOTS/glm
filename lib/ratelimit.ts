@@ -12,7 +12,7 @@
  * logged via console.warn so operators see it.
  *
  * Limits are defined per-route-bucket. Buckets are matched by URL
- * prefix in middleware.ts. Each bucket has:
+ * prefix in proxy.ts. Each bucket has:
  *   - max: max requests in the window
  *   - windowSec: window size in seconds
  *   - scope: "user" | "ip" — whether to key by authenticated user or
@@ -30,12 +30,22 @@ export interface RateLimit {
 }
 
 export const RATE_LIMITS: Record<string, RateLimit> = {
-  // Auth — strict per-IP to slow brute force
+  // Auth — strict per-IP to slow brute force.
+  // NOTE: NextAuth's credentials sign-in actually POSTs to
+  // /api/auth/callback/credentials — that bucket is the one that
+  // protects password guessing. /api/auth/signin is kept for direct
+  // hits on the NextAuth signin endpoint.
+  "POST:/api/auth/callback/credentials": { max: 5, windowSec: 60, scope: "ip" },
   "POST:/api/auth/signin": { max: 5, windowSec: 60, scope: "ip" },
   "POST:/api/auth/signup": { max: 3, windowSec: 3600, scope: "ip" },
   "POST:/api/auth/forgot-password": { max: 3, windowSec: 3600, scope: "ip" },
   "POST:/api/auth/reset-password": { max: 5, windowSec: 3600, scope: "ip" },
   "POST:/api/auth/seed": { max: 5, windowSec: 3600, scope: "ip" },
+  // Sensitive account mutations — authenticated, but still bounded so
+  // a stolen session can't brute-force the current password or spam
+  // destructive endpoints.
+  "POST:/api/auth/change-password": { max: 5, windowSec: 3600, scope: "user" },
+  "POST:/api/auth/delete-account": { max: 3, windowSec: 3600, scope: "user" },
 
   // Expensive AI routes — per-user
   "POST:/api/chat": { max: 30, windowSec: 60, scope: "user" },

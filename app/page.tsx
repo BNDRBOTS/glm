@@ -369,6 +369,23 @@ export default function HomePage() {
     setActiveChatId(id);
     setMessages([]);
     setDistillation(null);
+    // Restore the intent-drift badge from the server-side distillation
+    // state — otherwise it resets on every reload/chat switch even
+    // though the state survives on the server.
+    fetch(`/api/distillation?chatId=${encodeURIComponent(id)}`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((j) => {
+        if (j?.state) {
+          setDistillation({
+            alignment: j.state.overallAlignment,
+            driftDetected: j.state.driftDetected,
+            entityCount: j.state.entityCount,
+            factCount: j.state.factCount,
+            decisionCount: j.state.decisionCount,
+          });
+        }
+      })
+      .catch(() => {});
     try {
       const r = await fetch(`/api/chats/${id}`);
       if (!r.ok) {
@@ -390,6 +407,7 @@ export default function HomePage() {
             thinking: m.thinking ?? undefined,
             sources: Array.isArray(m.sources) ? m.sources : undefined,
             createdAt: m.createdAt,
+            attachments: Array.isArray(m.attachments) && m.attachments.length > 0 ? m.attachments : undefined,
           }))
         );
       }

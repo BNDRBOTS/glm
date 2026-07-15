@@ -62,6 +62,12 @@ export interface ChatRequest {
   systemSuffix?: string;
   // Reasoning toggle — on by default for reasoning-capable models
   thinking?: boolean;
+  /**
+   * Abort signal — when the caller (e.g. a disconnecting client)
+   * aborts, the upstream request is cancelled too instead of burning
+   * tokens on a response nobody will receive.
+   */
+  signal?: AbortSignal;
 }
 
 const PROVIDER_CONFIG: Record<
@@ -187,6 +193,7 @@ export class GLMClient {
           Authorization: `Bearer ${apiKey}`,
         },
         body: JSON.stringify(body),
+        signal: req.signal,
       });
 
       if (!res.ok || !res.body) {

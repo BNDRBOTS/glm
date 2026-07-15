@@ -39,11 +39,19 @@ export async function POST(
   if (!role) {
     return NextResponse.json({ error: "Group not found or not a member" }, { status: 404 });
   }
+  // Membership changes are a privilege boundary: only OWNER/ADMIN can
+  // add members, and only the OWNER can grant the ADMIN role.
+  if (role !== "OWNER" && role !== "ADMIN") {
+    return NextResponse.json({ error: "Only owners and admins can add members" }, { status: 403 });
+  }
 
   const body = (await req.json().catch(() => ({}))) as { email?: string; role?: string };
   const email = body.email?.toLowerCase().trim();
   if (!email) {
     return NextResponse.json({ error: "Email required" }, { status: 400 });
+  }
+  if (body.role === "ADMIN" && role !== "OWNER") {
+    return NextResponse.json({ error: "Only the group owner can grant the admin role" }, { status: 403 });
   }
   const newRole = body.role === "ADMIN" ? "ADMIN" : "MEMBER";
 

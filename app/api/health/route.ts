@@ -19,7 +19,7 @@
  *   }
  *
  * Railway's healthcheck only needs a 2xx — the deps object is for
- * humans. This route is EXCLUDED from rate limiting (see middleware.ts)
+ * humans. This route is EXCLUDED from rate limiting (see proxy.ts)
  * because Railway pings it every few seconds.
  */
 

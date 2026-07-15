@@ -4,13 +4,18 @@ import * as React from "react";
 import { useTheme } from "next-themes";
 import { cn } from "@/lib/utils";
 
-// Hydration-safe mounted flag: false during SSR/hydration, true on the
-// client — without a setState-in-effect (react-hooks/set-state-in-effect).
+// Hydration detector: server snapshot is false, client snapshot is
+// true, so the first client render matches SSR output and the theme
+// icon appears right after hydration — same behavior as the old
+// setMounted-in-effect pattern without the extra render cascade.
 const emptySubscribe = () => () => {};
+function useMounted() {
+  return React.useSyncExternalStore(emptySubscribe, () => true, () => false);
+}
 
 export function ThemeToggle({ className }: { className?: string }) {
   const { theme, setTheme } = useTheme();
-  const mounted = React.useSyncExternalStore(emptySubscribe, () => true, () => false);
+  const mounted = useMounted();
 
   const isDark = theme === "dark";
 

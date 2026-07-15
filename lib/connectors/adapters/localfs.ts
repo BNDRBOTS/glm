@@ -5,10 +5,11 @@ import type { Connector, ConnectorContext } from "../registry";
  * Set LOCAL_FS_ROOT to a folder. Connector reads/writes within it.
  *
  * SECURITY: path traversal is blocked — resolves against root and
- * rejects anything that escapes.
+ * rejects anything that escapes (path.relative containment, not a
+ * startsWith prefix check which admits sibling dirs like `<root>-x`).
  */
 import { promises as fs } from "fs";
-import * as path from "path";
+import { resolveInsideRoot } from "@/lib/fs-boundary";
 
 export const localfsConnector: Connector = {
   manifest: {
@@ -52,10 +53,7 @@ export const localfsConnector: Connector = {
   async fetch(ctx: ConnectorContext, id: string) {
     const root = ctx.credentials.root || process.env.LOCAL_FS_ROOT;
     if (!root) throw new Error("LOCAL_FS_ROOT not set — cannot resolve paths");
-    const safe = path.resolve(root, id);
-    if (!safe.startsWith(path.resolve(root))) {
-      throw new Error("Path traversal blocked");
-    }
+    const safe = resolveInsideRoot(root, id);
     const content = await fs.readFile(safe, "utf-8");
     return {
       id,
@@ -68,10 +66,7 @@ export const localfsConnector: Connector = {
   async push(ctx: ConnectorContext, resourceId: string, content: string) {
     const root = ctx.credentials.root || process.env.LOCAL_FS_ROOT;
     if (!root) throw new Error("LOCAL_FS_ROOT not set — cannot resolve paths");
-    const safe = path.resolve(root, resourceId);
-    if (!safe.startsWith(path.resolve(root))) {
-      throw new Error("Path traversal blocked");
-    }
+    const safe = resolveInsideRoot(root, resourceId);
     await fs.writeFile(safe, content, "utf-8");
     return { ok: true, url: `file://${safe}` };
   },

@@ -1,5 +1,5 @@
 /**
- * Next.js middleware.
+ * Next.js proxy (the Next 16 name for the middleware file convention).
  * ---------------------------------------------------------------------
  * Runs on every request before the route handler. Currently:
  *   1. Resolves the client IP (X-Forwarded-For or connection remote).
@@ -26,14 +26,14 @@ export const config = {
   ],
 };
 
-export async function middleware(req: NextRequest) {
+export async function proxy(req: NextRequest) {
   // Skip health — Railway pings it every few seconds, would burn limit.
   if (req.nextUrl.pathname === "/api/health") {
     return NextResponse.next();
   }
 
   const ip = getClientIp(req);
-  const userId = getUserIdFromJwt(req);
+  const userId = await getSessionFingerprint(req);
   const method = req.method;
   const path = req.nextUrl.pathname;
 
@@ -81,34 +81,33 @@ function getClientIp(req: NextRequest): string {
 }
 
 /**
- * Extract userId from the NextAuth session JWT WITHOUT verifying it
- * (verification is the route's job). We just need the id for
- * rate-limit keying so a single abuser can't dodge their per-user
- * limit by sending requests without cookies — though note that
- * unauthenticated requests fall back to IP-based limiting anyway.
+ * Derive a stable per-session subject for rate-limit keying.
  *
- * NextAuth v4 stores the JWT in a cookie named `next-auth.session-token`
- * (or `__Secure-next-auth.session-token` in HTTPS prod). The JWT body
- * is base64url-encoded JSON; we decode it without signature
- * verification just to read the `id` claim.
+ * NextAuth v4's session cookie is NOT a 3-part JWS — it's an encrypted
+ * JWE (5 base64url segments), so the previous "decode the JWT payload"
+ * approach always returned null and every "user"-scoped limit silently
+ * degraded to per-IP keying. Decrypting the JWE in middleware would
+ * drag key-derivation into the hot path; instead we key by a SHA-256
+ * fingerprint of the session cookie itself. That is exactly as stable
+ * as the session (one bucket per signed-in session), never exposes the
+ * raw token in bucket names/logs, and requires no crypto secrets here.
+ * Requests without a session cookie fall back to IP-based limiting.
  */
-function getUserIdFromJwt(req: NextRequest): string | null {
-  const cookieName = process.env.NODE_ENV === "production"
-    ? "__Secure-next-auth.session-token"
-    : "next-auth.session-token";
-  const cookie = req.cookies.get(cookieName)?.value;
+async function getSessionFingerprint(req: NextRequest): Promise<string | null> {
+  // Check both cookie names — deployments behind TLS use the
+  // __Secure- prefix, local dev does not. Checking both is robust to
+  // NODE_ENV mismatches.
+  const cookie =
+    req.cookies.get("__Secure-next-auth.session-token")?.value ??
+    req.cookies.get("next-auth.session-token")?.value;
   if (!cookie) return null;
-
-  // JWT format: header.payload.signature
-  const parts = cookie.split(".");
-  if (parts.length !== 3) return null;
   try {
-    const payload = JSON.parse(
-      Buffer.from(parts[1], "base64url").toString("utf-8")
-    );
-    // NextAuth puts the user id in token.id (set in the jwt callback).
-    const id = payload?.id;
-    return typeof id === "string" ? id : null;
+    const data = new TextEncoder().encode(cookie);
+    const digest = await crypto.subtle.digest("SHA-256", data);
+    const hex = Array.from(new Uint8Array(digest))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+    return `sess:${hex.slice(0, 32)}`;
   } catch {
     return null;
   }

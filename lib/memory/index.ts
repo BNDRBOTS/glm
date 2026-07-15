@@ -20,7 +20,14 @@ import { db } from "@/lib/db";
 export interface TurnRecord {
   messageId: string;
   chatId: string;
+  /** Who authored the turn — null for assistant/system turns. */
   authorId: string | null;
+  /**
+   * Which user's memory this turn belongs to (the chat owner /
+   * effective user). Kept separate from authorId so assistant turns
+   * are never misattributed to the human user in the journal.
+   */
+  ownerId?: string | null;
   role: string;
   content: string;
   model?: string | null;
@@ -30,6 +37,8 @@ export interface TurnRecord {
   timestamp: string;
   factsExtracted?: string[];
   entities?: string[];
+  /** True when the turn was cut short (client abort / stream error). */
+  truncated?: boolean;
 }
 
 export interface DeepAggregateResult {
@@ -46,17 +55,48 @@ export interface DeepAggregateResult {
 
 /**
  * Persist a turn record. Called after every assistant or user message.
+ *
+ * NEVER throws. The Message table is the authoritative transcript;
+ * MemoryLog is the secondary journal that feeds extractDeep(). A
+ * journal write failure must not abort the chat turn — but it must
+ * not be silent either, so failures are surfaced to the AuditLog
+ * (and stderr as a last resort).
+ *
+ * The MemoryLog row is keyed by the memory OWNER (rec.ownerId,
+ * falling back to rec.authorId). Rows are never written with a
+ * synthetic non-existent user id — MemoryLog.userId has a foreign key
+ * to User, and a fake id would make the write fail on every turn.
  */
 export async function logTurn(rec: Omit<TurnRecord, "timestamp">): Promise<void> {
-  const payload = JSON.stringify({ ...rec, timestamp: new Date().toISOString() });
-  await db.memoryLog.create({
-    data: {
-      userId: rec.authorId ?? "system",
-      chatId: rec.chatId,
-      payload,
-      kind: "TURN",
-    },
-  });
+  const ownerId = rec.ownerId ?? rec.authorId;
+  try {
+    if (!ownerId) {
+      throw new Error("logTurn requires ownerId or authorId to scope the memory row");
+    }
+    const payload = JSON.stringify({ ...rec, ownerId, timestamp: new Date().toISOString() });
+    await db.memoryLog.create({
+      data: {
+        userId: ownerId,
+        chatId: rec.chatId,
+        payload,
+        kind: "TURN",
+      },
+    });
+  } catch (e) {
+    try {
+      const { logAudit } = await import("@/lib/audit");
+      await logAudit({
+        userId: ownerId ?? null,
+        source: "system",
+        level: "error",
+        event: "memory.turn_log_failed",
+        payload: { chatId: rec.chatId, messageId: rec.messageId, role: rec.role, error: String(e) },
+        chatId: rec.chatId,
+      });
+    } catch {
+      console.error(`[memory] turn log failed for chat ${rec.chatId}: ${String(e)}`);
+    }
+  }
 }
 
 /**
@@ -143,42 +183,55 @@ export async function extractDeep(chatId: string): Promise<DeepAggregateResult> 
 
 /**
  * Raw chat export — every message, no transformation.
+ * Includes authorship, the structured turnLog, and thread pointers so
+ * the export is a complete, verbatim record of the stored transcript
+ * (not a lossy projection of it).
  */
 export async function exportRaw(chatId: string) {
   const messages = await db.message.findMany({
     where: { chatId },
-    orderBy: { createdAt: "asc" },
+    orderBy: [{ createdAt: "asc" }, { id: "asc" }],
     include: { attachments: true },
   });
   return {
     chatId,
     exportedAt: new Date().toISOString(),
-    messages: messages.map((m) => {
-      // RAG source citations are stored as a JSON string — decode for
-      // the export so "every message verbatim" includes them as data.
-      let sources: unknown = null;
-      if (m.sources) {
-        try { sources = JSON.parse(m.sources); } catch { sources = m.sources; }
-      }
-      return {
-        id: m.id,
-        role: m.role,
-        content: m.content,
-        model: m.model,
-        thinking: m.thinking,
-        sources,
-        tokens: {
-          prompt: m.promptTokens,
-          completion: m.completionTokens,
-          total: m.totalTokens,
-        },
-        attachments: m.attachments.map((a) => ({
-          filename: a.filename,
-          mimeType: a.mimeType,
-          size: a.size,
-        })),
-        createdAt: m.createdAt,
-      };
-    }),
+    messages: messages.map((m) => ({
+      id: m.id,
+      role: m.role,
+      authorId: m.authorId,
+      content: m.content,
+      model: m.model,
+      // Reasoning trace + RAG source citations (JSON string columns —
+      // decoded so "every message verbatim" includes them as data).
+      thinking: m.thinking,
+      sources: safeParseJson(m.sources),
+      turnLog: safeParseJson(m.turnLog),
+      toolCalls: safeParseJson(m.toolCalls),
+      parentMessageId: m.parentMessageId,
+      tokens: {
+        prompt: m.promptTokens,
+        completion: m.completionTokens,
+        total: m.totalTokens,
+      },
+      attachments: m.attachments.map((a) => ({
+        filename: a.filename,
+        mimeType: a.mimeType,
+        size: a.size,
+        storage: a.storage,
+        storageKey: a.storageKey,
+      })),
+      createdAt: m.createdAt,
+    })),
   };
+}
+
+/** Parse a stored JSON column; return the raw string if it isn't valid JSON. */
+function safeParseJson(s: string | null): unknown {
+  if (s == null) return null;
+  try {
+    return JSON.parse(s);
+  } catch {
+    return s;
+  }
 }
